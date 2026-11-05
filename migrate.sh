@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -73,6 +73,74 @@ ask_ssh_transfer() {
         [yY]|[yY][eE][sS]|[дД]|[дД][аА]) echo "true" ;;
         *) echo "false" ;;
     esac
+}
+
+# ── Определение SSH порта ─────────────────────────────────────────────────────
+detect_ssh_port() {
+    local config_file="${1:-/etc/ssh/sshd_config}"
+    local port=""
+    if [[ -f "$config_file" ]]; then
+        port="$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' "$config_file" 2>/dev/null | awk '{print $2}' | tail -1 || true)"
+    fi
+    if [[ -z "$port" && -d "/etc/ssh/sshd_config.d" ]]; then
+        port="$(grep -h -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | tail -1 || true)"
+    fi
+    if [[ -z "$port" ]] && command -v ss >/dev/null 2>&1; then
+        port="$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F: '{print $NF}' | head -1 || true)"
+    fi
+    echo "${port:-22}"
+}
+
+# ── Настройка и включение UFW фаервола ─────────────────────────────────────────
+setup_ufw_firewall() {
+    local ssh_port="${1:-22}"
+    local extra_ports="${2:-}"
+
+    log "Установка и настройка фаервола UFW..."
+    if ! command -v ufw >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq ufw
+    fi
+
+    # Включаем поддержку IPv6 в UFW (если файл доступен)
+    if [[ -f /etc/default/ufw ]]; then
+        sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw 2>/dev/null || true
+    fi
+
+    # Базовые правила
+    ufw default deny incoming >/dev/null 2>&1 || true
+    ufw default allow outgoing >/dev/null 2>&1 || true
+
+    # 1. SSH порт
+    log "Открытие SSH порта (${ssh_port}/tcp)..."
+    ufw allow "${ssh_port}/tcp" comment "SSH Port" >/dev/null
+
+    # 2. Веб порты (80/tcp, 443/tcp, 443/udp)
+    log "Открытие веб-портов (80/tcp, 443/tcp, 443/udp)..."
+    ufw allow 80/tcp comment "HTTP" >/dev/null
+    ufw allow 443/tcp comment "HTTPS" >/dev/null
+    ufw allow 443/udp comment "QUIC / HTTP3" >/dev/null
+
+    # 3. Дополнительные порты
+    if [[ -n "$extra_ports" ]]; then
+        for p in $extra_ports; do
+            p="$(echo "$p" | tr -d '[:space:]')"
+            if [[ -n "$p" ]]; then
+                log "Открытие дополнительного порта: $p..."
+                ufw allow "$p" >/dev/null || warn "Не удалось открыть порт: $p"
+            fi
+        done
+    fi
+
+    # 4. Включение UFW
+    log "Активация фаервола UFW..."
+    ufw --force enable >/dev/null
+    systemctl enable --now ufw >/dev/null 2>&1 || true
+    ok "UFW успешно настроен и активирован!"
+
+    echo
+    ufw status
+    echo
 }
 
 # ── 1. Сканирование и автоопределение компонентов ─────────────────────────────
@@ -286,6 +354,20 @@ run_scan_audit() {
         printf '  %s[ ]%s %-16s .ssh/authorized_keys, .ssh/authorized_key и sshd_config не найдены\n' \
             "$C_DIM" "$C_RESET" "SSH настройки"
     fi
+
+    # UFW диагностика
+    local ufw_status="не установлен"
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -qi "active"; then
+            ufw_status="активен"
+        else
+            ufw_status="отключен"
+        fi
+    fi
+    local detected_ssh_port_scan
+    detected_ssh_port_scan="$(detect_ssh_port "/etc/ssh/sshd_config")"
+    printf '  %s[i]%s %-16s %s (SSH порт: %s, веб-порты: 80, 443)\n' \
+        "$C_CYAN" "$C_RESET" "UFW фаервол" "$ufw_status" "$detected_ssh_port_scan"
 
     printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
     printf 'Готовность к миграции: обнаружено %s ключевых компонентов.\n' "$count"
@@ -724,6 +806,25 @@ EOF
     ok "  Все перенесённые службы успешно развёрнуты и запущены!  "
     ok "=========================================================="
 
+    # 8. Настройка и включение UFW фаервола
+    local target_ssh_port
+    target_ssh_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
+    log "Настройка фаервола UFW (SSH порт: $target_ssh_port, веб-порты: 80/tcp, 443/tcp, 443/udp)..."
+
+    printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+
+    local raw_extra_ports=""
+    if [[ -r /dev/tty ]]; then
+        read -r raw_extra_ports < /dev/tty || true
+    else
+        read -r raw_extra_ports || true
+    fi
+    local extra_ports
+    extra_ports="$(echo "$raw_extra_ports" | tr -d '\r\n')"
+
+    setup_ufw_firewall "$target_ssh_port" "$extra_ports"
+
     prompt_3xui_installation
 }
 
@@ -935,6 +1036,20 @@ main() {
             fi
             run_scan_audit
             ;;
+        ufw)
+            ensure_root
+            banner
+            local detected_port
+            detected_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
+            log "Настройка фаервола UFW (SSH порт: $detected_port)..."
+            printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
+                "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+            local raw_extra=""
+            if [[ -r /dev/tty ]]; then read -r raw_extra < /dev/tty || true; else read -r raw_extra || true; fi
+            local extra_ports
+            extra_ports="$(echo "$raw_extra" | tr -d '\r\n')"
+            setup_ufw_firewall "$detected_port" "$extra_ports"
+            ;;
         ""|-h|--help)
             ensure_root
             interactive_menu
@@ -942,7 +1057,7 @@ main() {
         *)
             banner
             err "Неизвестная команда: $cmd"
-            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan]"
+            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw]"
             exit 1
             ;;
     esac

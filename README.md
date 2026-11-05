@@ -44,6 +44,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main
 | **Nginx** | Конфигурации `/etc/nginx/nginx.conf` и `/etc/nginx/conf.d/*` | Установка `nginx` и `libnginx-mod-stream`, проверка `nginx -t`, немедленная остановка службы (`systemctl stop nginx`) для освобождения 80 порта |
 | **Copyparty** | Файлы `/opt/copyparty` (или `~/copyparty`): `copyparty`, `copyparty.conf`, `docker-compose.yml`, `hists` | Развёртывание в `/opt/copyparty` и запуск `docker compose up -d` |
 | **SSH настройки** | `.ssh/authorized_keys`, `.ssh/authorized_key` и `/etc/ssh/sshd_config` (опционально по вопросу `[y/N]`) | Восстановление ключей и конфига с правами `600`, рестарт служб `ssh` и `sshd` |
+| **UFW Фаервол** | Автоматическая установка и настройка | Открытие портов `80/tcp`, `443/tcp`, `443/udp` и SSH-порта (автоопределение из конфига или 22), запрос доп. портов, включение |
 | **3x-ui** | Обнаружение существующей панели | Интерактивное предложение запуска мастера Sanaei в конце работы |
 
 ---

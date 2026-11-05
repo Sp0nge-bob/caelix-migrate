@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.5"
+VERSION="1.0.6"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -107,7 +107,8 @@ setup_ufw_firewall() {
         sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw 2>/dev/null || true
     fi
 
-    # Базовые правила
+    # Базовые политики
+    log "Установка политик по умолчанию (deny incoming, allow outgoing)..."
     ufw default deny incoming >/dev/null 2>&1 || true
     ufw default allow outgoing >/dev/null 2>&1 || true
 

@@ -14,7 +14,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -45,20 +45,21 @@ ensure_root() {
 }
 
 find_path() {
-    local candidates=("$@")
-    for p in "${candidates[@]}"; do
+    for p in "$@"; do
         if [[ -e "$p" ]]; then
             echo "$p"
             return 0
         fi
     done
-    return 1
+    return 0
 }
 
 # ── 1. Сканирование и автоопределение компонентов ─────────────────────────────
 scan_components() {
     local silent="${1:-false}"
-    [[ "$silent" != "true" ]] && log "Сканирование установленных компонентов на сервере..."
+    if [[ "$silent" != "true" ]]; then
+        log "Сканирование установленных компонентов на сервере..."
+    fi
 
     DETECTED_BOT=""
     DETECTED_WEB=""
@@ -70,52 +71,66 @@ scan_components() {
 
     # 1. VPN-Bot
     local bot_path
-    bot_path="$(find_path "/opt/vpn-bot" "/root/vpn-platega-bot" "/opt/vpn-platega-bot" || true)"
+    bot_path="$(find_path "/opt/vpn-bot" "/root/vpn-platega-bot" "/opt/vpn-platega-bot")"
     if [[ -n "$bot_path" && (-f "$bot_path/app.py" || -f "$bot_path/run_bot.py") ]]; then
         DETECTED_BOT="$bot_path"
-        [[ "$silent" != "true" ]] && ok "Обнаружен Vpn-Bot: $DETECTED_BOT"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен Vpn-Bot: $DETECTED_BOT"
+        fi
     fi
 
     # 2. VPN-Website
     local web_path
-    web_path="$(find_path "/opt/vpn-website" "/root/vpn-website" || true)"
+    web_path="$(find_path "/opt/vpn-website" "/root/vpn-website")"
     if [[ -n "$web_path" && -f "$web_path/app/main.py" ]]; then
         DETECTED_WEB="$web_path"
-        [[ "$silent" != "true" ]] && ok "Обнаружен Vpn-Website: $DETECTED_WEB"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен Vpn-Website: $DETECTED_WEB"
+        fi
     fi
 
     # 3. MiddlewareJSON
     local mw_path
-    mw_path="$(find_path "/opt/middlewarejson" "/root/middlewarejson" || true)"
+    mw_path="$(find_path "/opt/middlewarejson" "/root/middlewarejson")"
     if [[ -n "$mw_path" && -f "$mw_path/app/main.py" ]]; then
         DETECTED_MW="$mw_path"
-        [[ "$silent" != "true" ]] && ok "Обнаружен MiddlewareJSON: $DETECTED_MW"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен MiddlewareJSON: $DETECTED_MW"
+        fi
     fi
 
     # 4. Redis
     if command -v redis-server >/dev/null 2>&1 || systemctl is-active --quiet redis-server 2>/dev/null; then
         DETECTED_REDIS="true"
-        [[ "$silent" != "true" ]] && ok "Обнаружен Redis-server"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен Redis-server"
+        fi
     fi
 
     # 5. Nginx
     if [[ -f "/etc/nginx/nginx.conf" || -d "/etc/nginx/conf.d" ]]; then
         DETECTED_NGINX="true"
-        [[ "$silent" != "true" ]] && ok "Обнаружен Nginx (/etc/nginx/nginx.conf, /etc/nginx/conf.d/)"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен Nginx (/etc/nginx/nginx.conf, /etc/nginx/conf.d/)"
+        fi
     fi
 
     # 6. Copyparty
     local cp_path
-    cp_path="$(find_path "/opt/copyparty" "/root/copyparty" || true)"
+    cp_path="$(find_path "/opt/copyparty" "/root/copyparty")"
     if [[ -n "$cp_path" && (-f "$cp_path/docker-compose.yml" || -f "$cp_path/copyparty.conf") ]]; then
         DETECTED_COPYPARTY="$cp_path"
-        [[ "$silent" != "true" ]] && ok "Обнаружен Copyparty: $DETECTED_COPYPARTY"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен Copyparty: $DETECTED_COPYPARTY"
+        fi
     fi
 
     # 7. 3x-ui
     if [[ -d "/etc/x-ui" || -d "/usr/local/x-ui" || -f "/etc/x-ui/x-ui.db" ]] || systemctl is-active --quiet x-ui 2>/dev/null; then
         DETECTED_XUI="true"
-        [[ "$silent" != "true" ]] && ok "Обнаружен 3x-ui (интерактивный мастер будет предложен в финале)"
+        if [[ "$silent" != "true" ]]; then
+            ok "Обнаружен 3x-ui (интерактивный мастер будет предложен в финале)"
+        fi
     fi
 }
 
@@ -130,25 +145,39 @@ run_scan_audit() {
 
     if [[ -n "$DETECTED_BOT" ]]; then
         local db_info="нет bot.db"
-        [[ -f "$DETECTED_BOT/data/bot.db" ]] && db_info="bot.db: $(du -h "$DETECTED_BOT/data/bot.db" | cut -f1)"
+        if [[ -f "$DETECTED_BOT/data/bot.db" ]]; then
+            db_info="bot.db: $(du -h "$DETECTED_BOT/data/bot.db" 2>/dev/null | cut -f1 || echo "есть")"
+        fi
+        local env_info="нет"
+        if [[ -f "$DETECTED_BOT/.env" ]]; then
+            env_info="OK"
+        fi
         printf '  %s[✔]%s %-16s %s (%s, .env: %s)\n' \
-            "$C_GREEN" "$C_RESET" "Vpn-Bot" "$DETECTED_BOT" "$db_info" "$([ -f "$DETECTED_BOT/.env" ] && echo "OK" || echo "нет")"
+            "$C_GREEN" "$C_RESET" "Vpn-Bot" "$DETECTED_BOT" "$db_info" "$env_info"
         count=$((count + 1))
     else
         printf '  %s[ ]%s %-16s не найден\n' "$C_DIM" "$C_RESET" "Vpn-Bot"
     fi
 
     if [[ -n "$DETECTED_WEB" ]]; then
+        local env_info="нет"
+        if [[ -f "$DETECTED_WEB/.env" ]]; then
+            env_info="OK"
+        fi
         printf '  %s[✔]%s %-16s %s (.env: %s)\n' \
-            "$C_GREEN" "$C_RESET" "Vpn-Website" "$DETECTED_WEB" "$([ -f "$DETECTED_WEB/.env" ] && echo "OK" || echo "нет")"
+            "$C_GREEN" "$C_RESET" "Vpn-Website" "$DETECTED_WEB" "$env_info"
         count=$((count + 1))
     else
         printf '  %s[ ]%s %-16s не найден\n' "$C_DIM" "$C_RESET" "Vpn-Website"
     fi
 
     if [[ -n "$DETECTED_MW" ]]; then
+        local env_info="нет"
+        if [[ -f "$DETECTED_MW/.env" ]]; then
+            env_info="OK"
+        fi
         printf '  %s[✔]%s %-16s %s (.env: %s)\n' \
-            "$C_GREEN" "$C_RESET" "MiddlewareJSON" "$DETECTED_MW" "$([ -f "$DETECTED_MW/.env" ] && echo "OK" || echo "нет")"
+            "$C_GREEN" "$C_RESET" "MiddlewareJSON" "$DETECTED_MW" "$env_info"
         count=$((count + 1))
     else
         printf '  %s[ ]%s %-16s не найден\n' "$C_DIM" "$C_RESET" "MiddlewareJSON"
@@ -163,7 +192,9 @@ run_scan_audit() {
 
     if [[ "$DETECTED_NGINX" == "true" ]]; then
         local conf_count=0
-        [[ -d "/etc/nginx/conf.d" ]] && conf_count="$(find /etc/nginx/conf.d -maxdepth 1 -type f | wc -l || true)"
+        if [[ -d "/etc/nginx/conf.d" ]]; then
+            conf_count="$(find /etc/nginx/conf.d -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)"
+        fi
         printf '  %s[✔]%s %-16s /etc/nginx/nginx.conf и %s файлов в conf.d/\n' "$C_GREEN" "$C_RESET" "Nginx" "$conf_count"
         count=$((count + 1))
     else
@@ -171,8 +202,12 @@ run_scan_audit() {
     fi
 
     if [[ -n "$DETECTED_COPYPARTY" ]]; then
+        local cp_dc="нет"
+        if [[ -f "$DETECTED_COPYPARTY/docker-compose.yml" ]]; then
+            cp_dc="OK"
+        fi
         printf '  %s[✔]%s %-16s %s (docker-compose: %s)\n' \
-            "$C_GREEN" "$C_RESET" "Copyparty" "$DETECTED_COPYPARTY" "$([ -f "$DETECTED_COPYPARTY/docker-compose.yml" ] && echo "OK" || echo "нет")"
+            "$C_GREEN" "$C_RESET" "Copyparty" "$DETECTED_COPYPARTY" "$cp_dc"
         count=$((count + 1))
     else
         printf '  %s[ ]%s %-16s не найден\n' "$C_DIM" "$C_RESET" "Copyparty"
@@ -183,7 +218,7 @@ run_scan_audit() {
     fi
 
     printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
-    printf 'Готовность к миграции: обнаружено %s компонентов.\n\n' "$count"
+    printf 'Готовность к миграции: обнаружено %s компонентов.\n' "$count"
 }
 
 # ── 3. Упаковка в защищённый бандл (PACK) ─────────────────────────────────────
@@ -563,14 +598,16 @@ prompt_3xui_installation() {
     printf '\n%s?%s %sНачать установку 3x-ui прямо сейчас?%s %s[y/N]%s: ' \
         "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
 
-    local answer=""
+    local raw_answer=""
     if [[ -r /dev/tty ]]; then
-        read -r answer < /dev/tty || true
+        read -r raw_answer < /dev/tty || true
     else
-        read -r answer || true
+        read -r raw_answer || true
     fi
+    local answer
+    answer="$(echo "${raw_answer:-N}" | tr -d '[:space:]')"
 
-    case "${answer:-N}" in
+    case "$answer" in
         [yY]|[yY][eE][sS]|[дД]|[дД][аА])
             log "Запуск официального мастера 3x-ui (порт 80 свободен)..."
             echo
@@ -588,8 +625,13 @@ push_to_target() {
     local target_ssh="${1:-}"
     if [[ -z "$target_ssh" ]]; then
         printf '%s? Введите SSH адрес целевого сервера (например, root@194.87.1.2): %s' "$C_CYAN" "$C_RESET"
-        read -r target_ssh || true
+        if [[ -r /dev/tty ]]; then
+            read -r target_ssh < /dev/tty || true
+        else
+            read -r target_ssh || true
+        fi
     fi
+    target_ssh="$(echo "${target_ssh:-}" | tr -d '[:space:]')"
     [[ -n "$target_ssh" ]] || die "SSH-адрес сервера не указан."
 
     log "Запуск прямого переноса НА $target_ssh..."
@@ -614,8 +656,13 @@ pull_from_source() {
     local source_ssh="${1:-}"
     if [[ -z "$source_ssh" ]]; then
         printf '%s? Введите SSH адрес старого сервера (например, root@194.87.1.2): %s' "$C_CYAN" "$C_RESET"
-        read -r source_ssh || true
+        if [[ -r /dev/tty ]]; then
+            read -r source_ssh < /dev/tty || true
+        else
+            read -r source_ssh || true
+        fi
     fi
+    source_ssh="$(echo "${source_ssh:-}" | tr -d '[:space:]')"
     [[ -n "$source_ssh" ]] || die "SSH-адрес сервера не указан."
 
     log "Подключение к старому серверу $source_ssh для сбора данных..."
@@ -634,46 +681,80 @@ pull_from_source() {
 
 # ── 9. Интерактивное главное меню ─────────────────────────────────────────────
 interactive_menu() {
-    banner
-    printf '  %s1)%s  %s[PUSH]%s   Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  %s2)%s  %s[PULL]%s   Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  %s3)%s  %s[PACK]%s   Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  %s4)%s  %s[UNPACK]%s Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  %s5)%s  %s[SCAN]%s   Проверить, что будет перенесено (Dry Run, только аудит)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  %s0)%s  Выход\n\n' "$C_DIM" "$C_RESET"
+    while true; do
+        banner
+        printf '  %s1)%s  %s[PUSH]%s   Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s2)%s  %s[PULL]%s   Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s3)%s  %s[PACK]%s   Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s4)%s  %s[UNPACK]%s Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s5)%s  %s[SCAN]%s   Проверить, что будет перенесено (Dry Run, только аудит)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s0)%s  Выход\n\n' "$C_DIM" "$C_RESET"
 
-    local choice=""
-    printf '%sВыберите действие [0-5]: %s' "$C_BOLD" "$C_RESET"
-    if [[ -r /dev/tty ]]; then
-        read -r choice < /dev/tty || true
-    else
-        read -r choice || true
-    fi
+        local raw_choice=""
+        printf '%sВыберите действие [0-5]: %s' "$C_BOLD" "$C_RESET"
+        if [[ -r /dev/tty ]]; then
+            read -r raw_choice < /dev/tty || true
+        else
+            read -r raw_choice || true
+        fi
 
-    case "${choice:-0}" in
-        1) push_to_target ;;
-        2) pull_from_source ;;
-        3)
-            local out=""
-            printf '%sПуть для архива [/root/caelix-migration-%s.tar.gz]: %s' "$C_CYAN" "$(date +%Y%m%d_%H%M%S)" "$C_RESET"
-            read -r out || true
-            [[ -z "$out" ]] && out="/root/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz"
-            scan_components
-            pack_components "$out"
-            ;;
-        4)
-            local in_file=""
-            local latest_default
-            latest_default="$(find /root /tmp -maxdepth 2 -name "caelix-*.tar.gz" 2>/dev/null | head -1 || true)"
-            printf '%sПуть к архиву [%s]: %s' "$C_CYAN" "${latest_default:-/root/backup.tar.gz}" "$C_RESET"
-            read -r in_file || true
-            [[ -z "$in_file" ]] && in_file="$latest_default"
-            unpack_and_deploy "$in_file"
-            ;;
-        5) run_scan_audit ;;
-        0) echo "Выход."; exit 0 ;;
-        *) warn "Неверный выбор."; exit 1 ;;
-    esac
+        local choice
+        choice="$(echo "${raw_choice:-0}" | tr -d '[:space:]')"
+
+        case "$choice" in
+            1)
+                push_to_target
+                break
+                ;;
+            2)
+                pull_from_source
+                break
+                ;;
+            3)
+                local out=""
+                printf '%sПуть для архива [/root/caelix-migration-%s.tar.gz]: %s' "$C_CYAN" "$(date +%Y%m%d_%H%M%S)" "$C_RESET"
+                if [[ -r /dev/tty ]]; then
+                    read -r out < /dev/tty || true
+                else
+                    read -r out || true
+                fi
+                out="$(echo "$out" | tr -d '[:space:]')"
+                [[ -z "$out" ]] && out="/root/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz"
+                scan_components
+                pack_components "$out"
+                printf '\nНажмите Enter, чтобы продолжить...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
+                ;;
+            4)
+                local in_file=""
+                local latest_default
+                latest_default="$(find /root /tmp -maxdepth 2 -name "caelix-*.tar.gz" 2>/dev/null | head -1 || true)"
+                printf '%sПуть к архиву [%s]: %s' "$C_CYAN" "${latest_default:-/root/backup.tar.gz}" "$C_RESET"
+                if [[ -r /dev/tty ]]; then
+                    read -r in_file < /dev/tty || true
+                else
+                    read -r in_file || true
+                fi
+                in_file="$(echo "$in_file" | tr -d '[:space:]')"
+                [[ -z "$in_file" ]] && in_file="$latest_default"
+                unpack_and_deploy "$in_file"
+                break
+                ;;
+            5)
+                run_scan_audit
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
+                ;;
+            0|q|Q)
+                echo "Выход."
+                exit 0
+                ;;
+            *)
+                warn "Неверный выбор: '$choice'."
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ── 10. Точка входа ───────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #
 # Особенности:
 #   - Автоопределение сервисов (Vpn-Bot, Website, Middleware, Redis, Nginx, Copyparty, 3x-ui)
+#   - Опциональный перенос настроек SSH (.ssh/authorized_keys и /etc/ssh/sshd_config)
 #   - Полная совместимость с чистым Debian 13 (Trixie)
 #   - Автоматическая установка Docker, Python-venv, Redis, Nginx + stream
 #   - Безопасные горячие снимки SQLite (WAL .backup)
@@ -14,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.3"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -54,6 +55,26 @@ find_path() {
     return 0
 }
 
+# ── Опрос переноса SSH настроек ───────────────────────────────────────────────
+ask_ssh_transfer() {
+    printf '\n%s?%s %sПеренести настройки SSH (.ssh/authorized_keys, .ssh/authorized_key и sshd_config)?%s %s[y/N]%s: ' \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+
+    local raw_ans=""
+    if [[ -r /dev/tty ]]; then
+        read -r raw_ans < /dev/tty || true
+    else
+        read -r raw_ans || true
+    fi
+    local ans
+    ans="$(echo "${raw_ans:-N}" | tr -d '[:space:]')"
+
+    case "$ans" in
+        [yY]|[yY][eE][sS]|[дД]|[дД][аА]) echo "true" ;;
+        *) echo "false" ;;
+    esac
+}
+
 # ── 1. Сканирование и автоопределение компонентов ─────────────────────────────
 scan_components() {
     local silent="${1:-false}"
@@ -68,6 +89,8 @@ scan_components() {
     DETECTED_NGINX="false"
     DETECTED_COPYPARTY=""
     DETECTED_XUI="false"
+    DETECTED_SSH_KEYS=""
+    DETECTED_SSHD_CONF="false"
 
     # 1. VPN-Bot
     local bot_path
@@ -131,6 +154,24 @@ scan_components() {
         if [[ "$silent" != "true" ]]; then
             ok "Обнаружен 3x-ui (интерактивный мастер будет предложен в финале)"
         fi
+    fi
+
+    # 8. SSH настройки (проверяем authorized_keys и authorized_key)
+    DETECTED_SSH_AUTHORIZED_KEYS=""
+    DETECTED_SSH_AUTHORIZED_KEY=""
+    DETECTED_SSHD_CONF="false"
+
+    for dir in "/root/.ssh" "$HOME/.ssh"; do
+        if [[ -f "$dir/authorized_keys" && -z "$DETECTED_SSH_AUTHORIZED_KEYS" ]]; then
+            DETECTED_SSH_AUTHORIZED_KEYS="$dir/authorized_keys"
+        fi
+        if [[ -f "$dir/authorized_key" && -z "$DETECTED_SSH_AUTHORIZED_KEY" ]]; then
+            DETECTED_SSH_AUTHORIZED_KEY="$dir/authorized_key"
+        fi
+    done
+
+    if [[ -f "/etc/ssh/sshd_config" ]]; then
+        DETECTED_SSHD_CONF="true"
     fi
 }
 
@@ -217,13 +258,43 @@ run_scan_audit() {
         printf '  %s[i]%s %-16s обнаружен (будет предложена установка мастером на новом сервере)\n' "$C_CYAN" "$C_RESET" "3x-ui"
     fi
 
+    # 8. SSH диагностика
+    local ssh_keys_desc=()
+    if [[ -n "$DETECTED_SSH_AUTHORIZED_KEYS" ]]; then
+        local count_keys
+        count_keys="$(grep -c -E "^(ssh-|ecdsa-|sk-)" "$DETECTED_SSH_AUTHORIZED_KEYS" 2>/dev/null || echo "1+")"
+        ssh_keys_desc+=("authorized_keys ($count_keys шт.)")
+    fi
+    if [[ -n "$DETECTED_SSH_AUTHORIZED_KEY" ]]; then
+        local count_key
+        count_key="$(grep -c -E "^(ssh-|ecdsa-|sk-)" "$DETECTED_SSH_AUTHORIZED_KEY" 2>/dev/null || echo "1+")"
+        ssh_keys_desc+=("authorized_key ($count_key шт.)")
+    fi
+
+    if [[ ${#ssh_keys_desc[@]} -gt 0 || "$DETECTED_SSHD_CONF" == "true" ]]; then
+        local keys_label="не найдены"
+        if [[ ${#ssh_keys_desc[@]} -gt 0 ]]; then
+            keys_label="$(IFS=", "; echo "${ssh_keys_desc[*]}")"
+        fi
+        local sshd_label="sshd_config: нет"
+        if [[ "$DETECTED_SSHD_CONF" == "true" ]]; then
+            sshd_label="sshd_config: OK"
+        fi
+        printf '  %s[✔]%s %-16s Ключи: %s | %s (будет предложен перенос)\n' \
+            "$C_GREEN" "$C_RESET" "SSH настройки" "$keys_label" "$sshd_label"
+    else
+        printf '  %s[ ]%s %-16s .ssh/authorized_keys, .ssh/authorized_key и sshd_config не найдены\n' \
+            "$C_DIM" "$C_RESET" "SSH настройки"
+    fi
+
     printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
-    printf 'Готовность к миграции: обнаружено %s компонентов.\n' "$count"
+    printf 'Готовность к миграции: обнаружено %s ключевых компонентов.\n' "$count"
 }
 
 # ── 3. Упаковка в защищённый бандл (PACK) ─────────────────────────────────────
 pack_components() {
     local target_archive="${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}"
+    local with_ssh="${2:-false}"
     local staging
     staging="$(mktemp -d /tmp/caelix_pack_XXXXXX)"
     chmod 700 "$staging"
@@ -243,6 +314,7 @@ pack_components() {
         echo "HAS_NGINX=\"$DETECTED_NGINX\""
         echo "HAS_COPYPARTY=\"$([ -n "$DETECTED_COPYPARTY" ] && echo true || echo false)\""
         echo "HAS_XUI=\"$DETECTED_XUI\""
+        echo "HAS_SSH=\"$with_ssh\""
     } > "$manifest"
 
     # 1. VPN-Bot
@@ -313,6 +385,26 @@ pack_components() {
         log "Сбор Copyparty ($DETECTED_COPYPARTY)..."
         mkdir -p "$staging/copyparty"
         rsync -a "$DETECTED_COPYPARTY/" "$staging/copyparty/" 2>/dev/null || true
+    fi
+
+    # 6. SSH (authorized_keys, authorized_key и sshd_config)
+    if [[ "$with_ssh" == "true" ]]; then
+        log "Сбор настроек SSH (.ssh/authorized_keys, .ssh/authorized_key, sshd_config)..."
+        mkdir -p "$staging/ssh"
+
+        # Собираем authorized_keys и/или authorized_key
+        for fname in "authorized_keys" "authorized_key"; do
+            for dir in "/root/.ssh" "$HOME/.ssh"; do
+                if [[ -f "$dir/$fname" ]]; then
+                    cp -a "$dir/$fname" "$staging/ssh/$fname"
+                    break
+                fi
+            done
+        done
+
+        if [[ -f "/etc/ssh/sshd_config" ]]; then
+            cp -a "/etc/ssh/sshd_config" "$staging/ssh/sshd_config"
+        fi
     fi
 
     log "Упаковка архива $target_archive..."
@@ -411,7 +503,49 @@ EOF
         chmod 440 /etc/sudoers.d/vpn-bot-restart
     fi
 
-    # 3. Nginx конфиги (служба остаётся выключенной)
+    # 3. SSH настройки (authorized_keys, authorized_key и sshd_config)
+    if [[ "${HAS_SSH:-false}" == "true" && -d "$staging/ssh" ]]; then
+        log "Восстановление настроек SSH..."
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+
+        local keys_restored=false
+        if [[ -f "$staging/ssh/authorized_keys" ]]; then
+            cp -a "$staging/ssh/authorized_keys" /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+            keys_restored=true
+        fi
+        if [[ -f "$staging/ssh/authorized_key" ]]; then
+            cp -a "$staging/ssh/authorized_key" /root/.ssh/authorized_key
+            chmod 600 /root/.ssh/authorized_key
+            keys_restored=true
+        fi
+
+        # Дублируем для абсолютной совместимости (если был только authorized_key или только authorized_keys)
+        if [[ -f "/root/.ssh/authorized_key" && ! -f "/root/.ssh/authorized_keys" ]]; then
+            cp -a "/root/.ssh/authorized_key" "/root/.ssh/authorized_keys"
+            chmod 600 "/root/.ssh/authorized_keys"
+        elif [[ -f "/root/.ssh/authorized_keys" && ! -f "/root/.ssh/authorized_key" ]]; then
+            cp -a "/root/.ssh/authorized_keys" "/root/.ssh/authorized_key"
+            chmod 600 "/root/.ssh/authorized_key"
+        fi
+
+        if [[ "$keys_restored" == "true" ]]; then
+            ok "Ключи SSH (.ssh/authorized_keys и/или .ssh/authorized_key) успешно восстановлены"
+        fi
+
+        if [[ -f "$staging/ssh/sshd_config" ]]; then
+            cp -a "$staging/ssh/sshd_config" /etc/ssh/sshd_config
+            ok "Конфигурация SSH (/etc/ssh/sshd_config) обновлена"
+        fi
+
+        log "Перезапуск службы SSH (systemctl restart ssh sshd)..."
+        systemctl restart ssh 2>/dev/null || true
+        systemctl restart sshd 2>/dev/null || true
+        ok "Службы SSH успешно перезапущены"
+    fi
+
+    # 4. Nginx конфиги (служба остаётся выключенной)
     if [[ "${HAS_NGINX:-false}" == "true" && -d "$staging/nginx" ]]; then
         log "Раскладка конфигурации Nginx..."
         mkdir -p /etc/nginx/conf.d
@@ -424,7 +558,7 @@ EOF
         ok "Конфиги Nginx разложены. Служба Nginx выключена для освобождения 80 порта."
     fi
 
-    # 4. Copyparty
+    # 5. Copyparty
     if [[ "${HAS_COPYPARTY:-false}" == "true" && -d "$staging/copyparty" ]]; then
         log "Восстановление Copyparty в /opt/copyparty..."
         mkdir -p /opt/copyparty
@@ -444,7 +578,7 @@ EOF
         fi
     fi
 
-    # 5. MiddlewareJSON
+    # 6. MiddlewareJSON
     if [[ "${HAS_MW:-false}" == "true" && -d "$staging/mw" ]]; then
         log "Восстановление MiddlewareJSON в /opt/middlewarejson..."
         mkdir -p /opt/middlewarejson
@@ -484,7 +618,7 @@ EOF
         ok "MiddlewareJSON запущен"
     fi
 
-    # 6. Vpn-Website
+    # 7. Vpn-Website
     if [[ "${HAS_WEB:-false}" == "true" && -d "$staging/web" ]]; then
         log "Восстановление Vpn-Website в /opt/vpn-website..."
         mkdir -p /opt/vpn-website
@@ -520,7 +654,7 @@ EOF
         ok "Vpn-Website запущен"
     fi
 
-    # 7. Vpn-Bot
+    # 8. Vpn-Bot
     if [[ "${HAS_BOT:-false}" == "true" && -d "$staging/bot" ]]; then
         log "Восстановление Vpn-Bot в /opt/vpn-bot..."
         mkdir -p /opt/vpn-bot
@@ -634,11 +768,14 @@ push_to_target() {
     target_ssh="$(echo "${target_ssh:-}" | tr -d '[:space:]')"
     [[ -n "$target_ssh" ]] || die "SSH-адрес сервера не указан."
 
-    log "Запуск прямого переноса НА $target_ssh..."
+    local with_ssh="false"
+    with_ssh="$(ask_ssh_transfer)"
+
+    log "Запуск прямого переноса НА $target_ssh (перенос SSH: $with_ssh)..."
     scan_components
 
     local tmp_archive="/tmp/caelix_transfer_$(date +%s).tar.gz"
-    pack_components "$tmp_archive"
+    pack_components "$tmp_archive" "$with_ssh"
 
     log "Копирование скрипта и архива на $target_ssh..."
     scp -o StrictHostKeyChecking=accept-new "$0" "${target_ssh}:/tmp/migrate.sh"
@@ -665,9 +802,12 @@ pull_from_source() {
     source_ssh="$(echo "${source_ssh:-}" | tr -d '[:space:]')"
     [[ -n "$source_ssh" ]] || die "SSH-адрес сервера не указан."
 
-    log "Подключение к старому серверу $source_ssh для сбора данных..."
+    local with_ssh="false"
+    with_ssh="$(ask_ssh_transfer)"
+
+    log "Подключение к старому серверу $source_ssh для сбора данных (перенос SSH: $with_ssh)..."
     scp -o StrictHostKeyChecking=accept-new "$0" "${source_ssh}:/tmp/migrate.sh"
-    ssh -t -o StrictHostKeyChecking=accept-new "$source_ssh" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz"
+    ssh -t -o StrictHostKeyChecking=accept-new "$source_ssh" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz $with_ssh"
 
     local local_archive="/tmp/caelix-bundle.tar.gz"
     log "Загрузка архива со старого сервера..."
@@ -720,8 +860,12 @@ interactive_menu() {
                 fi
                 out="$(echo "$out" | tr -d '[:space:]')"
                 [[ -z "$out" ]] && out="/root/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz"
+
+                local with_ssh="false"
+                with_ssh="$(ask_ssh_transfer)"
+
                 scan_components
-                pack_components "$out"
+                pack_components "$out" "$with_ssh"
                 printf '\nНажмите Enter, чтобы продолжить...'
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
@@ -777,7 +921,7 @@ main() {
             ensure_root
             banner
             scan_components
-            pack_components "${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}"
+            pack_components "${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}" "${2:-false}"
             ;;
         unpack)
             ensure_root

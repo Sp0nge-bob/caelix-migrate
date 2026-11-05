@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.6"
+VERSION="1.0.7"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -922,19 +922,48 @@ pull_from_source() {
     rm -f "$local_archive"
 }
 
+# ── 8.5. Проверка IP через iplense.cc ──────────────────────────────────────────
+check_ip_iplense() {
+    log "Запуск проверки IP и чистоты сети через iplense.cc..."
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "Утилита curl не найдена. Попытка установки..."
+        if command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq && apt-get install -y -qq curl || true
+        fi
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        err "Для проверки IP требуется curl. Установите его вручную: apt install -y curl"
+        return 1
+    fi
+
+    echo
+    bash <(curl -sL https://iplense.cc/cli) -l en || {
+        warn "Прямой запуск через подстановку процессов не удался, пробуем пайп..."
+        curl -sL https://iplense.cc/cli | bash -s -- -l en || true
+    }
+}
+
 # ── 9. Интерактивное главное меню ─────────────────────────────────────────────
 interactive_menu() {
     while true; do
         banner
-        printf '  %s1)%s  %s[PUSH]%s   Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s2)%s  %s[PULL]%s   Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s3)%s  %s[PACK]%s   Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s4)%s  %s[UNPACK]%s Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s5)%s  %s[SCAN]%s   Проверить, что будет перенесено (Dry Run, только аудит)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+            warn "Скрипт запущен без прав root. Пункты [1-4] потребуют прав root (sudo)."
+            echo
+        fi
+
+        printf '  %s1)%s  %s[PUSH]%s    Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s2)%s  %s[PULL]%s    Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s3)%s  %s[PACK]%s    Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s4)%s  %s[UNPACK]%s  Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s5)%s  %s[SCAN]%s    Проверить, что будет перенесено (Dry Run, только аудит)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s6)%s  %s[IPLENSE]%s Проверить IP адрес и чистоту сети (iplense.cc)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s0)%s  Выход\n\n' "$C_DIM" "$C_RESET"
 
         local raw_choice=""
-        printf '%sВыберите действие [0-5]: %s' "$C_BOLD" "$C_RESET"
+        printf '%sВыберите действие [0-6]: %s' "$C_BOLD" "$C_RESET"
         if [[ -r /dev/tty ]]; then
             read -r raw_choice < /dev/tty || true
         else
@@ -946,14 +975,17 @@ interactive_menu() {
 
         case "$choice" in
             1)
+                ensure_root
                 push_to_target
                 break
                 ;;
             2)
+                ensure_root
                 pull_from_source
                 break
                 ;;
             3)
+                ensure_root
                 local out=""
                 printf '%sПуть для архива [/root/caelix-migration-%s.tar.gz]: %s' "$C_CYAN" "$(date +%Y%m%d_%H%M%S)" "$C_RESET"
                 if [[ -r /dev/tty ]]; then
@@ -973,6 +1005,7 @@ interactive_menu() {
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
             4)
+                ensure_root
                 local in_file=""
                 local latest_default
                 latest_default="$(find /root /tmp -maxdepth 2 -name "caelix-*.tar.gz" 2>/dev/null | head -1 || true)"
@@ -989,6 +1022,11 @@ interactive_menu() {
                 ;;
             5)
                 run_scan_audit
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
+                ;;
+            6)
+                check_ip_iplense
                 printf '\nНажмите Enter, чтобы вернуться в меню...'
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
@@ -1038,6 +1076,10 @@ main() {
             fi
             run_scan_audit
             ;;
+        ip|iplense|check-ip|checkip)
+            banner
+            check_ip_iplense
+            ;;
         ufw)
             ensure_root
             banner
@@ -1053,13 +1095,12 @@ main() {
             setup_ufw_firewall "$detected_port" "$extra_ports"
             ;;
         ""|-h|--help)
-            ensure_root
             interactive_menu
             ;;
         *)
             banner
             err "Неизвестная команда: $cmd"
-            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw]"
+            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip]"
             exit 1
             ;;
     esac

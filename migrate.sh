@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -111,9 +111,10 @@ setup_ufw_firewall() {
     ufw default deny incoming >/dev/null 2>&1 || true
     ufw default allow outgoing >/dev/null 2>&1 || true
 
-    # 1. SSH порт
-    log "Открытие SSH порта (${ssh_port}/tcp)..."
-    ufw allow "${ssh_port}/tcp" comment "SSH Port" >/dev/null
+    # 1. SSH порт (TCP и UDP)
+    log "Открытие SSH порта (${ssh_port}/tcp и ${ssh_port}/udp)..."
+    ufw allow "${ssh_port}/tcp" comment "SSH Port TCP" >/dev/null
+    ufw allow "${ssh_port}/udp" comment "SSH Port UDP" >/dev/null
 
     # 2. Веб порты (80/tcp, 443/tcp, 443/udp)
     log "Открытие веб-портов (80/tcp, 443/tcp, 443/udp)..."
@@ -366,7 +367,7 @@ run_scan_audit() {
     fi
     local detected_ssh_port_scan
     detected_ssh_port_scan="$(detect_ssh_port "/etc/ssh/sshd_config")"
-    printf '  %s[i]%s %-16s %s (SSH порт: %s, веб-порты: 80, 443)\n' \
+    printf '  %s[i]%s %-16s %s (SSH порт: %s/tcp+udp, веб-порты: 80/tcp, 443/tcp+udp)\n' \
         "$C_CYAN" "$C_RESET" "UFW фаервол" "$ufw_status" "$detected_ssh_port_scan"
 
     printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
@@ -809,7 +810,7 @@ EOF
     # 8. Настройка и включение UFW фаервола
     local target_ssh_port
     target_ssh_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
-    log "Настройка фаервола UFW (SSH порт: $target_ssh_port, веб-порты: 80/tcp, 443/tcp, 443/udp)..."
+    log "Настройка фаервола UFW (SSH порт: $target_ssh_port/tcp+udp, веб-порты: 80/tcp, 443/tcp, 443/udp)..."
 
     printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
         "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
@@ -1041,7 +1042,7 @@ main() {
             banner
             local detected_port
             detected_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
-            log "Настройка фаервола UFW (SSH порт: $detected_port)..."
+            log "Настройка фаервола UFW (SSH порт: $detected_port/tcp+udp)..."
             printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
                 "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
             local raw_extra=""

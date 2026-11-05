@@ -678,34 +678,40 @@ interactive_menu() {
 
 # ── 10. Точка входа ───────────────────────────────────────────────────────────
 main() {
-    ensure_root
-
     local cmd="${1:-}"
     shift || true
 
     case "$cmd" in
         push)
+            ensure_root
             banner
             push_to_target "${1:-}"
             ;;
         pull)
+            ensure_root
             banner
             pull_from_source "${1:-}"
             ;;
         pack)
+            ensure_root
             banner
             scan_components
             pack_components "${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}"
             ;;
         unpack)
+            ensure_root
             banner
             unpack_and_deploy "${1:-}"
             ;;
         scan)
             banner
+            if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+                warn "Скрипт запущен без прав root. Некоторые пути могут быть недоступны для проверки."
+            fi
             run_scan_audit
             ;;
         ""|-h|--help)
+            ensure_root
             interactive_menu
             ;;
         *)

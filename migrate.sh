@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.7"
+VERSION="1.0.8"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -945,6 +945,51 @@ check_ip_iplense() {
     }
 }
 
+# ── 8.6. Измерение скорости интернета (speedtest-cli) ─────────────────────────
+run_speedtest() {
+    log "Запуск измерения скорости интернета (speedtest-cli)..."
+
+    # 1. Если speedtest-cli уже установлен
+    if command -v speedtest-cli >/dev/null 2>&1; then
+        echo
+        speedtest-cli "$@" || true
+        return 0
+    fi
+
+    # 2. Если установлен официальный Ookla speedtest
+    if command -v speedtest >/dev/null 2>&1; then
+        echo
+        speedtest "$@" || true
+        return 0
+    fi
+
+    # 3. Попытка быстрой установки через apt, если есть root
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
+        log "Установка пакета speedtest-cli через apt..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -y -qq speedtest-cli || true
+    fi
+
+    if command -v speedtest-cli >/dev/null 2>&1; then
+        echo
+        speedtest-cli "$@" || true
+        return 0
+    fi
+
+    # 4. Автономный запуск скрипта через python3 без необходимости установки пакетов
+    if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+        log "Запуск автономного speedtest-cli через Python 3..."
+        echo
+        python3 <(curl -sL https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py) "$@" || {
+            curl -sL https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py | python3 - "$@" || true
+        }
+        return 0
+    fi
+
+    err "Не удалось запустить speedtest-cli. Установите его командой: apt install -y speedtest-cli"
+    return 1
+}
+
 # ── 9. Интерактивное главное меню ─────────────────────────────────────────────
 interactive_menu() {
     while true; do
@@ -954,16 +999,17 @@ interactive_menu() {
             echo
         fi
 
-        printf '  %s1)%s  %s[PUSH]%s    Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s2)%s  %s[PULL]%s    Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s3)%s  %s[PACK]%s    Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s4)%s  %s[UNPACK]%s  Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s5)%s  %s[SCAN]%s    Проверить, что будет перенесено (Dry Run, только аудит)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s6)%s  %s[IPLENSE]%s Проверить IP адрес и чистоту сети (iplense.cc)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s1)%s  %s[PUSH]%s      Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s2)%s  %s[PULL]%s      Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s3)%s  %s[PACK]%s      Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s4)%s  %s[UNPACK]%s    Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s5)%s  %s[SCAN]%s      Проверить, что будет перенесено (Dry Run, только аудит)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s6)%s  %s[IPLENSE]%s   Проверить IP адрес и чистоту сети (iplense.cc)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s7)%s  %s[SPEEDTEST]%s Измерение скорости интернета (speedtest-cli)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s0)%s  Выход\n\n' "$C_DIM" "$C_RESET"
 
         local raw_choice=""
-        printf '%sВыберите действие [0-6]: %s' "$C_BOLD" "$C_RESET"
+        printf '%sВыберите действие [0-7]: %s' "$C_BOLD" "$C_RESET"
         if [[ -r /dev/tty ]]; then
             read -r raw_choice < /dev/tty || true
         else
@@ -1030,6 +1076,11 @@ interactive_menu() {
                 printf '\nНажмите Enter, чтобы вернуться в меню...'
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
+            7)
+                run_speedtest
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
+                ;;
             0|q|Q)
                 echo "Выход."
                 exit 0
@@ -1080,6 +1131,10 @@ main() {
             banner
             check_ip_iplense
             ;;
+        speed|speedtest|speedtest-cli)
+            banner
+            run_speedtest "$@"
+            ;;
         ufw)
             ensure_root
             banner
@@ -1100,7 +1155,7 @@ main() {
         *)
             banner
             err "Неизвестная команда: $cmd"
-            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip]"
+            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip|speed]"
             exit 1
             ;;
     esac

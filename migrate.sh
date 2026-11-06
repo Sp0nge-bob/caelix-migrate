@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.8"
+VERSION="1.0.9"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -243,6 +243,77 @@ scan_components() {
     if [[ -f "/etc/ssh/sshd_config" ]]; then
         DETECTED_SSHD_CONF="true"
     fi
+
+    # 9. SSL/TLS сертификаты (вне /root/cert)
+    DETECTED_LETSENCRYPT="false"
+    DETECTED_EXTRA_CERTS=()
+
+    # 9.1 Let's Encrypt (/etc/letsencrypt/live)
+    if [[ -d "/etc/letsencrypt/live" ]]; then
+        local le_count
+        le_count="$(find /etc/letsencrypt/live -type f -o -type l 2>/dev/null | wc -l || echo 0)"
+        if [[ "$le_count" -gt 0 ]]; then
+            DETECTED_LETSENCRYPT="true"
+            if [[ "$silent" != "true" ]]; then
+                ok "Обнаружены сертификаты Let's Encrypt: /etc/letsencrypt (будут перенесены)"
+            fi
+        fi
+    fi
+
+    # 9.2 Поиск путей к сертификатам в конфигах Nginx
+    local raw_cert_paths=()
+    if [[ -d "/etc/nginx" ]]; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] && raw_cert_paths+=("$p")
+        done < <(grep -h -E '^[[:space:]]*ssl_(certificate|certificate_key|trusted_certificate)[[:space:]]+' \
+            /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/sites-available/* 2>/dev/null \
+            | awk '{print $2}' | tr -d ';' | tr -d '"' | tr -d "'" | sort -u || true)
+
+        # Также проверяем кастомные каталоги /etc/nginx/ssl и /etc/nginx/certs
+        for cdir in "/etc/nginx/ssl" "/etc/nginx/certs"; do
+            if [[ -d "$cdir" ]]; then
+                while IFS= read -r f; do
+                    [[ -n "$f" ]] && raw_cert_paths+=("$f")
+                done < <(find "$cdir" -type f \( -name "*.crt" -o -name "*.key" -o -name "*.pem" \) 2>/dev/null || true)
+            fi
+        done
+    fi
+
+    # 9.3 Поиск путей к сертификатам в 3x-ui inbounds (x-ui.db)
+    for xdb in "/etc/x-ui/x-ui.db" "/usr/local/x-ui/x-ui.db"; do
+        if [[ -f "$xdb" ]] && command -v sqlite3 >/dev/null 2>&1; then
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && raw_cert_paths+=("$p")
+            done < <(sqlite3 "$xdb" "SELECT settings FROM inbounds;" 2>/dev/null \
+                | grep -oE '"(certificateFile|keyFile)":[[:space:]]*"[^"]+"' 2>/dev/null \
+                | awk -F'"' '{print $4}' | sort -u || true)
+        fi
+    done
+
+    # 9.4 Фильтрация: исключаем /root/cert*, исключаем /etc/letsencrypt* если уже переносится полностью
+    local seen_cert_paths=" "
+    for cp in "${raw_cert_paths[@]}"; do
+        [[ -z "$cp" ]] && continue
+        # Не переносим сертификаты из /root/cert (они создаются мастером 3x-ui на новом сервере)
+        if [[ "$cp" == /root/cert* ]]; then
+            continue
+        fi
+        # Если Let's Encrypt уже переносится целиком, не дублируем файлы в extra
+        if [[ "$DETECTED_LETSENCRYPT" == "true" && "$cp" == /etc/letsencrypt* ]]; then
+            continue
+        fi
+        # Проверяем существование файла или symlink
+        if [[ -e "$cp" || -L "$cp" ]]; then
+            if [[ "$seen_cert_paths" != *" $cp "* ]]; then
+                seen_cert_paths+="$cp "
+                DETECTED_EXTRA_CERTS+=("$cp")
+            fi
+        fi
+    done
+
+    if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 && "$silent" != "true" ]]; then
+        ok "Обнаружены внешние SSL сертификаты: ${#DETECTED_EXTRA_CERTS[@]} шт. вне /root/cert (будут перенесены)"
+    fi
 }
 
 # ── 2. Режим только аудит (SCAN / DRY RUN) ────────────────────────────────────
@@ -357,6 +428,29 @@ run_scan_audit() {
             "$C_DIM" "$C_RESET" "SSH настройки"
     fi
 
+    # 9. SSL/TLS сертификаты (вне /root/cert)
+    local certs_summary=()
+    if [[ "$DETECTED_LETSENCRYPT" == "true" ]]; then
+        local le_domains
+        le_domains="$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk -F/ '{print $NF}' | paste -sd, - 2>/dev/null || true)"
+        [[ -z "$le_domains" ]] && le_domains="активен"
+        certs_summary+=("Let's Encrypt: $le_domains")
+    fi
+    if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ]]; then
+        certs_summary+=("${#DETECTED_EXTRA_CERTS[@]} внешних файлов")
+    fi
+
+    if [[ ${#certs_summary[@]} -gt 0 ]]; then
+        local cert_desc
+        cert_desc="$(IFS=", "; echo "${certs_summary[*]}")"
+        printf '  %s[✔]%s %-16s %s (будут перенесены)\n' \
+            "$C_GREEN" "$C_RESET" "SSL сертификаты" "$cert_desc"
+        count=$((count + 1))
+    else
+        printf '  %s[i]%s %-16s в /root/cert или отсутствуют (выпуск через 3x-ui)\n' \
+            "$C_CYAN" "$C_RESET" "SSL сертификаты"
+    fi
+
     # UFW диагностика
     local ufw_status="не установлен"
     if command -v ufw >/dev/null 2>&1; then
@@ -399,6 +493,8 @@ pack_components() {
         echo "HAS_COPYPARTY=\"$([ -n "$DETECTED_COPYPARTY" ] && echo true || echo false)\""
         echo "HAS_XUI=\"$DETECTED_XUI\""
         echo "HAS_SSH=\"$with_ssh\""
+        echo "HAS_LETSENCRYPT=\"$([ "$DETECTED_LETSENCRYPT" == "true" ] && echo true || echo false)\""
+        echo "HAS_EXTRA_CERTS=\"$([ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ] && echo true || echo false)\""
     } > "$manifest"
 
     # 1. VPN-Bot
@@ -489,6 +585,26 @@ pack_components() {
         if [[ -f "/etc/ssh/sshd_config" ]]; then
             cp -a "/etc/ssh/sshd_config" "$staging/ssh/sshd_config"
         fi
+    fi
+
+    # 7. SSL/TLS сертификаты (вне /root/cert)
+    if [[ "$DETECTED_LETSENCRYPT" == "true" ]]; then
+        log "Сбор сертификатов Let's Encrypt (/etc/letsencrypt)..."
+        mkdir -p "$staging/certs/letsencrypt"
+        rsync -a /etc/letsencrypt/ "$staging/certs/letsencrypt/" 2>/dev/null || true
+    fi
+
+    if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ]]; then
+        log "Сбор внешних SSL сертификатов (${#DETECTED_EXTRA_CERTS[@]} файлов)..."
+        mkdir -p "$staging/certs/extra"
+        for cfile in "${DETECTED_EXTRA_CERTS[@]}"; do
+            if [[ -e "$cfile" || -L "$cfile" ]]; then
+                local rel_dir
+                rel_dir="$(dirname "$cfile" | sed 's|^/||')"
+                mkdir -p "$staging/certs/extra/$rel_dir"
+                cp -aL "$cfile" "$staging/certs/extra/$rel_dir/" 2>/dev/null || true
+            fi
+        done
     fi
 
     log "Упаковка архива $target_archive..."
@@ -629,6 +745,34 @@ EOF
         ok "Службы SSH успешно перезапущены"
     fi
 
+    # 3.5. Восстановление SSL/TLS сертификатов (вне /root/cert)
+    if [[ -d "$staging/certs/letsencrypt" ]]; then
+        log "Восстановление сертификатов Let's Encrypt в /etc/letsencrypt..."
+        mkdir -p /etc/letsencrypt
+        rsync -a "$staging/certs/letsencrypt/" /etc/letsencrypt/
+        chmod -R 755 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+        ok "Сертификаты Let's Encrypt успешно восстановлены"
+    fi
+
+    if [[ -d "$staging/certs/extra" ]]; then
+        log "Восстановление внешних SSL сертификатов..."
+        (
+            cd "$staging/certs/extra"
+            find . -type f | while IFS= read -r rel_file; do
+                local target_path="/${rel_file#./}"
+                mkdir -p "$(dirname "$target_path")"
+                cp -a "$rel_file" "$target_path"
+                if [[ "$target_path" == *key* || "$target_path" == *.key ]]; then
+                    chmod 600 "$target_path" 2>/dev/null || true
+                else
+                    chmod 644 "$target_path" 2>/dev/null || true
+                fi
+                log "Восстановлен SSL сертификат: $target_path"
+            done
+        )
+        ok "Внешние SSL сертификаты успешно восстановлены"
+    fi
+
     # 4. Nginx конфиги (служба остаётся выключенной)
     if [[ "${HAS_NGINX:-false}" == "true" && -d "$staging/nginx" ]]; then
         log "Раскладка конфигурации Nginx..."
@@ -637,7 +781,11 @@ EOF
         [[ -d "$staging/nginx/conf.d" ]] && cp -a "$staging/nginx/conf.d/"* /etc/nginx/conf.d/ 2>/dev/null || true
 
         log "Проверка синтаксиса Nginx (nginx -t)..."
-        nginx -t 2>/dev/null || warn "nginx -t сообщил о замечаниях (сертификаты /root/cert будут созданы после мастера 3x-ui)."
+        if nginx -t 2>/dev/null; then
+            ok "Синтаксис Nginx корректен."
+        else
+            warn "nginx -t сообщил о замечаниях (сертификаты /root/cert будут созданы после мастера 3x-ui)."
+        fi
         systemctl stop nginx 2>/dev/null || true
         ok "Конфиги Nginx разложены. Служба Nginx выключена для освобождения 80 порта."
     fi

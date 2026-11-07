@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -1041,6 +1041,7 @@ WorkingDirectory=/opt/middlewarejson
 ExecStart=/opt/middlewarejson/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8080
 Restart=always
 RestartSec=5
+TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -1079,6 +1080,7 @@ WorkingDirectory=/opt/vpn-website
 ExecStart=/opt/vpn-website/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 Restart=always
 RestartSec=5
+TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -1125,6 +1127,7 @@ WorkingDirectory=/opt/vpn-bot
 ExecStart=/opt/vpn-bot/.venv/bin/python run_bot.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -1144,6 +1147,7 @@ WorkingDirectory=/opt/vpn-bot
 ExecStart=/opt/vpn-bot/.venv/bin/python app.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

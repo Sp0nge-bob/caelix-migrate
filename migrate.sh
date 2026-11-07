@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -159,19 +159,60 @@ ask_ssh_endpoint() {
     echo "$user_host" "$port"
 }
 
-# ── Быстрая проверка SSH-подключения с таймаутом (Pre-flight check) ───────────
-verify_ssh_connection() {
+# ── Глобальные переменные SSH Multiplexing ───────────────────────────────────
+SSH_MUX_SOCKET=""
+SSH_MUX_OPTS=()
+
+# ── Инициализация единой мультиплексированной SSH сессии (ControlMaster) ─────
+init_ssh_session() {
     local endpoint="$1"
     local port="$2"
 
-    log "Проверка SSH-подключения к $endpoint (порт $port)..."
-    local check_output
-    if ! check_output=$(ssh -p "$port" -o ConnectTimeout=7 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=accept-new "$endpoint" "echo 'CAELIX_SSH_OK'" 2>&1); then
-        err "Ошибка подключения по SSH к $endpoint (порт $port):"
-        echo "$check_output" >&2
-        die "Не удалось подключиться. Проверьте IP адрес, SSH порт ($port), доступность сети и учетные данные."
+    local hash_id
+    hash_id="$(printf '%s_%s' "$endpoint" "$port" | md5sum 2>/dev/null | cut -c1-12 || printf '%s_%s' "$endpoint" "$port" | tr -cd '[:alnum:]' | cut -c1-12)"
+    SSH_MUX_SOCKET="/tmp/caelix_mux_${hash_id}.sock"
+
+    # Очистка мертвого сокета, если он остался от прошлых запусков
+    if [[ -S "$SSH_MUX_SOCKET" ]]; then
+        if ! ssh -O check -o "ControlPath=$SSH_MUX_SOCKET" -p "$port" "$endpoint" >/dev/null 2>&1; then
+            rm -f "$SSH_MUX_SOCKET" 2>/dev/null || true
+        fi
     fi
-    ok "SSH-подключение успешно установлено ($endpoint, порт $port)"
+
+    SSH_MUX_OPTS=(
+        -p "$port"
+        -o "ControlMaster=auto"
+        -o "ControlPath=$SSH_MUX_SOCKET"
+        -o "ControlPersist=30m"
+        -o "StrictHostKeyChecking=accept-new"
+        -o "ConnectTimeout=10"
+        -o "ServerAliveInterval=15"
+        -o "ServerAliveCountMax=3"
+    )
+
+    log "Проверка SSH-подключения к $endpoint (порт $port)..."
+    printf '%s==>%s %sВведите пароль ОДИН раз — мастер-сессия сохранится на всё время миграции:%s\n' "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET"
+
+    # Первое подключение инициирует master-соединение в фоне (через ControlPersist)
+    if ! ssh "${SSH_MUX_OPTS[@]}" "$endpoint" "echo 'CAELIX_SSH_OK'" >/dev/null; then
+        rm -f "$SSH_MUX_SOCKET" 2>/dev/null || true
+        die "Не удалось подключиться к $endpoint (порт $port). Проверьте адрес, порт и пароль."
+    fi
+
+    ok "Мастер-сессия SSH установлена ($endpoint, порт $port). Повторный ввод пароля не потребуется!"
+}
+
+# ── Завершение мультиплексированной SSH сессии ────────────────────────────────
+close_ssh_session() {
+    local endpoint="${1:-}"
+    local port="${2:-}"
+
+    if [[ -n "${SSH_MUX_SOCKET:-}" && -S "$SSH_MUX_SOCKET" ]]; then
+        if [[ -n "$endpoint" && -n "$port" ]]; then
+            ssh -O exit -o "ControlPath=$SSH_MUX_SOCKET" -p "$port" "$endpoint" >/dev/null 2>&1 || true
+        fi
+        rm -f "$SSH_MUX_SOCKET" 2>/dev/null || true
+    fi
 }
 
 # ── Получение локального исполняемого файла скрипта (обход /dev/fd/*) ─────────
@@ -202,10 +243,9 @@ deploy_remote_script() {
     local_script="$(get_runnable_script)"
 
     log "Доставка скрипта миграции на $endpoint..."
-    # Пробуем быстро скачать на удалённом сервере напрямую или загружаем через scp
     local remote_cmd="curl -fsSL https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main/migrate.sh -o /tmp/migrate.sh && chmod +x /tmp/migrate.sh"
-    if ! ssh -p "$port" -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$endpoint" "$remote_cmd" >/dev/null 2>&1; then
-        scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_script" "${endpoint}:/tmp/migrate.sh"
+    if ! ssh "${SSH_MUX_OPTS[@]}" "$endpoint" "$remote_cmd" >/dev/null 2>&1; then
+        scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "$local_script" "${endpoint}:/tmp/migrate.sh"
     fi
     ok "Скрипт миграции готов на $endpoint (/tmp/migrate.sh)"
 }
@@ -220,21 +260,22 @@ transfer_file() {
 
     log "Передача архива ($direction) через сеть..."
 
+    local ssh_cmd="ssh -p $port -o ControlPath=$SSH_MUX_SOCKET -o StrictHostKeyChecking=accept-new"
     if [[ "$direction" == "pull" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -avz --progress -e "ssh -p $port -o StrictHostKeyChecking=accept-new" \
+            rsync -avz --progress -e "$ssh_cmd" \
                 "${endpoint}:${remote_file}" "$local_file" || \
-            scp -P "$port" -o StrictHostKeyChecking=accept-new "${endpoint}:${remote_file}" "$local_file"
+            scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "${endpoint}:${remote_file}" "$local_file"
         else
-            scp -P "$port" -o StrictHostKeyChecking=accept-new "${endpoint}:${remote_file}" "$local_file"
+            scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "${endpoint}:${remote_file}" "$local_file"
         fi
     else # push
         if command -v rsync >/dev/null 2>&1; then
-            rsync -avz --progress -e "ssh -p $port -o StrictHostKeyChecking=accept-new" \
+            rsync -avz --progress -e "$ssh_cmd" \
                 "$local_file" "${endpoint}:${remote_file}" || \
-            scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_file" "${endpoint}:${remote_file}"
+            scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "$local_file" "${endpoint}:${remote_file}"
         else
-            scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_file" "${endpoint}:${remote_file}"
+            scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "$local_file" "${endpoint}:${remote_file}"
         fi
     fi
     ok "Передача архива завершена успешно."
@@ -1180,7 +1221,8 @@ push_to_target() {
     with_ssh="$(ask_ssh_transfer)"
 
     log "Запуск прямого переноса НА $target_endpoint (порт $target_port, перенос SSH: $with_ssh)..."
-    verify_ssh_connection "$target_endpoint" "$target_port"
+    init_ssh_session "$target_endpoint" "$target_port"
+    trap 'close_ssh_session "$target_endpoint" "$target_port"' EXIT INT TERM
 
     scan_components
 
@@ -1192,7 +1234,10 @@ push_to_target() {
     rm -f "$tmp_archive"
 
     log "Запуск развёртывания на $target_endpoint..."
-    ssh -t -p "$target_port" -o StrictHostKeyChecking=accept-new "$target_endpoint" "sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz"
+    ssh -t "${SSH_MUX_OPTS[@]}" "$target_endpoint" "sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz"
+
+    close_ssh_session "$target_endpoint" "$target_port"
+    trap - EXIT INT TERM
 
     ok "Миграция на $target_endpoint успешно завершена!"
 }
@@ -1210,16 +1255,20 @@ pull_from_source() {
     with_ssh="$(ask_ssh_transfer)"
 
     log "Подключение к старому серверу $source_endpoint (порт $source_port, перенос SSH: $with_ssh)..."
-    verify_ssh_connection "$source_endpoint" "$source_port"
+    init_ssh_session "$source_endpoint" "$source_port"
+    trap 'close_ssh_session "$source_endpoint" "$source_port"' EXIT INT TERM
 
     deploy_remote_script "$source_endpoint" "$source_port"
 
     log "Сборка архива на удаленном сервере ($source_endpoint)..."
-    ssh -t -p "$source_port" -o StrictHostKeyChecking=accept-new "$source_endpoint" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz '$with_ssh'"
+    ssh -t "${SSH_MUX_OPTS[@]}" "$source_endpoint" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz '$with_ssh'"
 
     local local_archive="/tmp/caelix-bundle.tar.gz"
     transfer_file "pull" "$source_endpoint" "$source_port" "/tmp/caelix-source-bundle.tar.gz" "$local_archive"
-    ssh -p "$source_port" -o StrictHostKeyChecking=accept-new "$source_endpoint" "rm -f /tmp/migrate.sh /tmp/caelix-source-bundle.tar.gz" 2>/dev/null || true
+    ssh "${SSH_MUX_OPTS[@]}" "$source_endpoint" "rm -f /tmp/migrate.sh /tmp/caelix-source-bundle.tar.gz" 2>/dev/null || true
+
+    close_ssh_session "$source_endpoint" "$source_port"
+    trap - EXIT INT TERM
 
     log "Начало развёртывания на текущем сервере..."
     unpack_and_deploy "$local_archive"

@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -869,6 +869,85 @@ install_system_dependencies() {
     ok "Все системные зависимости установлены."
 }
 
+# ── Установка системных команд и алиасов консоли ──────────────────────────────
+install_system_aliases_and_commands() {
+    log "Настройка системных команд и алиасов (vpnplategabot, vpnwebsite, bot, web)..."
+
+    # 1. VPN-Bot command
+    if [[ -d "/opt/vpn-bot/deploy" ]]; then
+        chmod +x /opt/vpn-bot/deploy/*.sh /opt/vpn-bot/deploy/lib/*.sh 2>/dev/null || true
+        cat << 'EOF' > /usr/local/bin/vpnplategabot
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR="/opt/vpn-bot"
+CTL="$APP_DIR/deploy/vpn-bot-ctl.sh"
+if [[ ! -f "$CTL" ]]; then
+    echo "ERR: не найден $CTL" >&2
+    exit 1
+fi
+exec bash "$CTL" "$@"
+EOF
+        chmod 755 /usr/local/bin/vpnplategabot
+        ln -sf /usr/local/bin/vpnplategabot /usr/local/bin/bot
+        ok "Установлена команда vpnplategabot (ярлык: bot)"
+    fi
+
+    # 2. VPN-Website command
+    if [[ -d "/opt/vpn-website/deploy" ]]; then
+        chmod +x /opt/vpn-website/deploy/*.sh /opt/vpn-website/deploy/lib/*.sh 2>/dev/null || true
+        cat << 'EOF' > /usr/local/bin/vpnwebsite
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR="/opt/vpn-website"
+CTL="$APP_DIR/deploy/vpn-website-ctl.sh"
+if [[ ! -f "$CTL" ]]; then
+    echo "ERR: не найден $CTL" >&2
+    exit 1
+fi
+exec bash "$CTL" "$@"
+EOF
+        chmod 755 /usr/local/bin/vpnwebsite
+        ln -sf /usr/local/bin/vpnwebsite /usr/local/bin/web
+        ok "Установлена команда vpnwebsite (ярлык: web)"
+    fi
+
+    # 3. Global shell profile aliases (/etc/profile.d/caelixflow.sh)
+    mkdir -p /etc/profile.d
+    cat << 'EOF' > /etc/profile.d/caelixflow.sh
+# ==============================================================================
+# CaelixFlow CLI Shortcuts & Management Aliases
+# ==============================================================================
+alias bot='vpnplategabot'
+alias web='vpnwebsite'
+
+alias bot-status='systemctl status vpn-bot-web vpn-bot-telegram'
+alias bot-restart='systemctl restart vpn-bot-web vpn-bot-telegram'
+alias bot-stop='systemctl stop vpn-bot-web vpn-bot-telegram'
+alias bot-start='systemctl start vpn-bot-web vpn-bot-telegram'
+alias bot-log='journalctl -u vpn-bot-web -u vpn-bot-telegram -f'
+alias bot-logs='journalctl -u vpn-bot-web -u vpn-bot-telegram -f'
+
+alias web-status='systemctl status vpn-website'
+alias web-restart='systemctl restart vpn-website'
+alias web-stop='systemctl stop vpn-website'
+alias web-start='systemctl start vpn-website'
+alias web-log='journalctl -u vpn-website -f'
+alias web-logs='journalctl -u vpn-website -f'
+
+alias caelix-status='systemctl status vpn-bot-web vpn-bot-telegram vpn-website nginx redis-server'
+alias caelix-restart='systemctl restart vpn-bot-web vpn-bot-telegram vpn-website'
+EOF
+    chmod 644 /etc/profile.d/caelixflow.sh
+
+    # Подключение в .bashrc для root и пользователей
+    for rc in /root/.bashrc /home/*/.bashrc; do
+        if [[ -f "$rc" ]] && ! grep -q "caelixflow.sh" "$rc" 2>/dev/null; then
+            printf '\n# CaelixFlow Aliases\n[ -f /etc/profile.d/caelixflow.sh ] && . /etc/profile.d/caelixflow.sh\n' >> "$rc"
+        fi
+    done
+    ok "Алиасы консоли прописаны в /etc/profile.d/caelixflow.sh и ~/.bashrc"
+}
+
 # ── 5. Развёртывание из архива (UNPACK) ────────────────────────────────────────
 unpack_and_deploy() {
     local source_archive="$1"
@@ -1159,11 +1238,21 @@ EOF
         ok "Vpn-Bot запущен"
     fi
 
+    # 9. Системные команды и алиасы консоли
+    install_system_aliases_and_commands
+
     rm -rf "$staging"
     echo
     ok "=========================================================="
     ok "  Все перенесённые службы успешно развёрнуты и запущены!  "
     ok "=========================================================="
+    printf '\n%sКоманды управления службами в консоли:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  • Бот:    %svpnplategabot%s  (или %sbot%s, %sbot-status%s, %sbot-restart%s, %sbot-logs%s)\n' \
+        "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf '  • Сайт:   %svpnwebsite%s     (или %sweb%s, %sweb-status%s, %sweb-restart%s, %sweb-logs%s)\n' \
+        "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf '  • Общее:  %scaelix-status%s, %scaelix-restart%s\n\n' \
+        "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
 
     # 8. Настройка и включение UFW фаервола
     local target_ssh_port

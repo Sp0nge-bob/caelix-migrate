@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -1061,6 +1061,7 @@ EOF
         log "Настройка Python .venv для Vpn-Website..."
         [[ ! -d "/opt/vpn-website/.venv" ]] && python3 -m venv /opt/vpn-website/.venv
         if [[ -f "/opt/vpn-website/requirements.txt" ]]; then
+            sed -i 's|^incy-link-encoder.*|incy-link-encoder @ git+https://github.com/INCY-DEV/incy-link-encoder.git#subdirectory=python|' /opt/vpn-website/requirements.txt
             log "Установка зависимостей Vpn-Website (pip)..."
             /opt/vpn-website/.venv/bin/pip install --upgrade pip 2>/dev/null || true
             /opt/vpn-website/.venv/bin/pip install --no-cache-dir -r /opt/vpn-website/requirements.txt
@@ -1102,6 +1103,7 @@ EOF
         log "Настройка Python .venv для Vpn-Bot..."
         [[ ! -d "/opt/vpn-bot/.venv" ]] && python3 -m venv /opt/vpn-bot/.venv
         if [[ -f "/opt/vpn-bot/requirements.txt" ]]; then
+            sed -i 's|^incy-link-encoder.*|incy-link-encoder @ git+https://github.com/INCY-DEV/incy-link-encoder.git#subdirectory=python|' /opt/vpn-bot/requirements.txt
             log "Установка зависимостей Vpn-Bot (pip)..."
             /opt/vpn-bot/.venv/bin/pip install --upgrade pip 2>/dev/null || true
             /opt/vpn-bot/.venv/bin/pip install --no-cache-dir -r /opt/vpn-bot/requirements.txt

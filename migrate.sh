@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.0.9"
+VERSION="1.1.0"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -58,7 +58,7 @@ find_path() {
 # ── Опрос переноса SSH настроек ───────────────────────────────────────────────
 ask_ssh_transfer() {
     printf '\n%s?%s %sПеренести настройки SSH (.ssh/authorized_keys, .ssh/authorized_key и sshd_config)?%s %s[y/N]%s: ' \
-        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
 
     local raw_ans=""
     if [[ -r /dev/tty ]]; then
@@ -89,6 +89,155 @@ detect_ssh_port() {
         port="$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F: '{print $NF}' | head -1 || true)"
     fi
     echo "${port:-22}"
+}
+
+# ── Парсинг SSH эндпоинта и порта ─────────────────────────────────────────────
+parse_ssh_endpoint() {
+    local raw_target="$1"
+    local raw_port="${2:-}"
+
+    local user_host="$raw_target"
+    local port="$raw_port"
+
+    # Поддержка синтаксиса -p PORT
+    if [[ "$user_host" =~ -p[[:space:]]*([0-9]+) ]]; then
+        port="${BASH_REMATCH[1]}"
+        user_host="$(echo "$user_host" | sed -E 's/-p[[:space:]]*[0-9]+//g')"
+    fi
+
+    # Поддержка синтаксиса host:port или user@host:port
+    if [[ "$user_host" =~ ^(.*):([0-9]+)$ ]]; then
+        user_host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    fi
+
+    user_host="$(echo "$user_host" | tr -d '[:space:]')"
+    port="$(echo "$port" | tr -d '[:space:]')"
+
+    # Если пользователь не указан, по умолчанию root
+    if [[ "$user_host" != *"@"* && -n "$user_host" ]]; then
+        user_host="root@$user_host"
+    fi
+
+    echo "$user_host" "${port:-22}"
+}
+
+# ── Интерактивный запрос адреса и порта SSH ───────────────────────────────────
+ask_ssh_endpoint() {
+    local prompt_label="$1"
+    local target_input=""
+    local port_input=""
+
+    printf '%s? %s (например, root@194.87.1.2 или root@194.87.1.2:2042): %s' \
+        "$C_CYAN" "$prompt_label" "$C_RESET" >&2
+
+    if [[ -r /dev/tty ]]; then
+        read -r target_input < /dev/tty || true
+    else
+        read -r target_input || true
+    fi
+    target_input="$(echo "${target_input:-}" | tr -d '[:space:]')"
+    [[ -n "$target_input" ]] || die "SSH-адрес сервера не указан."
+
+    local user_host port
+    read -r user_host port <<< "$(parse_ssh_endpoint "$target_input")"
+
+    # Если порт не был указан прямо в строке адреса, уточняем его интерактивно
+    if [[ "$target_input" != *":"* && "$target_input" != *"-p"* ]]; then
+        printf '%s? SSH порт сервера [%s]: %s' "$C_CYAN" "$port" "$C_RESET" >&2
+        if [[ -r /dev/tty ]]; then
+            read -r port_input < /dev/tty || true
+        else
+            read -r port_input || true
+        fi
+        port_input="$(echo "${port_input:-}" | tr -d '[:space:]')"
+        if [[ -n "$port_input" ]]; then
+            port="$port_input"
+        fi
+    fi
+
+    echo "$user_host" "$port"
+}
+
+# ── Быстрая проверка SSH-подключения с таймаутом (Pre-flight check) ───────────
+verify_ssh_connection() {
+    local endpoint="$1"
+    local port="$2"
+
+    log "Проверка SSH-подключения к $endpoint (порт $port)..."
+    local check_output
+    if ! check_output=$(ssh -p "$port" -o ConnectTimeout=7 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=accept-new "$endpoint" "echo 'CAELIX_SSH_OK'" 2>&1); then
+        err "Ошибка подключения по SSH к $endpoint (порт $port):"
+        echo "$check_output" >&2
+        die "Не удалось подключиться. Проверьте IP адрес, SSH порт ($port), доступность сети и учетные данные."
+    fi
+    ok "SSH-подключение успешно установлено ($endpoint, порт $port)"
+}
+
+# ── Получение локального исполняемого файла скрипта (обход /dev/fd/*) ─────────
+get_runnable_script() {
+    local cached_script="/tmp/caelix-migrate-local.sh"
+    # Если $0 — это реальный файл на диске
+    if [[ -f "${BASH_SOURCE[0]:-$0}" && ! "${BASH_SOURCE[0]:-$0}" =~ ^/dev/fd ]]; then
+        echo "${BASH_SOURCE[0]:-$0}"
+        return 0
+    fi
+
+    # Если скрипт запущен через pipe или подстановку процессов <(curl ...)
+    if [[ ! -s "$cached_script" ]]; then
+        log "Кэширование локальной копии скрипта в $cached_script..." >&2
+        if ! curl -fsSL "https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main/migrate.sh" -o "$cached_script"; then
+            cat "$0" > "$cached_script" 2>/dev/null || true
+        fi
+        chmod +x "$cached_script" 2>/dev/null || true
+    fi
+    echo "$cached_script"
+}
+
+# ── Доставка скрипта миграции на удаленный сервер ─────────────────────────────
+deploy_remote_script() {
+    local endpoint="$1"
+    local port="$2"
+    local local_script
+    local_script="$(get_runnable_script)"
+
+    log "Доставка скрипта миграции на $endpoint..."
+    # Пробуем быстро скачать на удалённом сервере напрямую или загружаем через scp
+    local remote_cmd="curl -fsSL https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main/migrate.sh -o /tmp/migrate.sh && chmod +x /tmp/migrate.sh"
+    if ! ssh -p "$port" -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$endpoint" "$remote_cmd" >/dev/null 2>&1; then
+        scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_script" "${endpoint}:/tmp/migrate.sh"
+    fi
+    ok "Скрипт миграции готов на $endpoint (/tmp/migrate.sh)"
+}
+
+# ── Передача файлов между серверами с визуальным прогрессом ───────────────────
+transfer_file() {
+    local direction="$1" # "pull" или "push"
+    local endpoint="$2"
+    local port="$3"
+    local remote_file="$4"
+    local local_file="$5"
+
+    log "Передача архива ($direction) через сеть..."
+
+    if [[ "$direction" == "pull" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -avz --progress -e "ssh -p $port -o StrictHostKeyChecking=accept-new" \
+                "${endpoint}:${remote_file}" "$local_file" || \
+            scp -P "$port" -o StrictHostKeyChecking=accept-new "${endpoint}:${remote_file}" "$local_file"
+        else
+            scp -P "$port" -o StrictHostKeyChecking=accept-new "${endpoint}:${remote_file}" "$local_file"
+        fi
+    else # push
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -avz --progress -e "ssh -p $port -o StrictHostKeyChecking=accept-new" \
+                "$local_file" "${endpoint}:${remote_file}" || \
+            scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_file" "${endpoint}:${remote_file}"
+        else
+            scp -P "$port" -o StrictHostKeyChecking=accept-new "$local_file" "${endpoint}:${remote_file}"
+        fi
+    fi
+    ok "Передача архива завершена успешно."
 }
 
 # ── Настройка и включение UFW фаервола ─────────────────────────────────────────
@@ -609,7 +758,11 @@ pack_components() {
 
     log "Упаковка архива $target_archive..."
     mkdir -p "$(dirname "$target_archive")"
-    tar -czf "$target_archive" -C "$staging" .
+    if command -v pigz >/dev/null 2>&1; then
+        tar -I pigz -cf "$target_archive" -C "$staging" .
+    else
+        tar -czf "$target_archive" -C "$staging" .
+    fi
     rm -rf "$staging"
 
     ok "Архив успешно создан: $target_archive ($(du -h "$target_archive" | cut -f1))"
@@ -617,44 +770,50 @@ pack_components() {
 
 # ── 4. Установка всех зависимостей на чистом Debian 13 (Trixie) ───────────────
 install_system_dependencies() {
+    local has_copyparty="${1:-false}"
     log "Установка системных зависимостей (Debian 13 Trixie)..."
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    log "Обновление списка пакетов (apt-get update)..."
+    apt-get update
 
     # 1. Системные утилиты и библиотеки Python
-    log "1/5. Системные пакеты (curl, git, rsync, sqlite3, python3-venv)..."
-    apt-get install -y -qq \
+    log "1/5. Системные пакеты (curl, git, rsync, sqlite3, python3-venv, pigz)..."
+    apt-get install -y --no-install-recommends \
         curl wget git rsync tar gzip bzip2 xz-utils sudo \
         ca-certificates gnupg lsb-release procps net-tools ufw \
-        sqlite3 jq \
+        sqlite3 jq pigz \
         python3 python3-venv python3-pip python3-dev \
         build-essential libffi-dev libssl-dev
 
     # 2. Redis
     log "2/5. Redis-server..."
-    apt-get install -y -qq redis-server
+    apt-get install -y --no-install-recommends redis-server
     systemctl enable --now redis-server || true
 
     # 3. Nginx и stream модуль (Служба СРАЗУ останавливается!)
     log "3/5. Nginx + libnginx-mod-stream (с немедленной остановкой для 80 порта)..."
-    apt-get install -y -qq nginx libnginx-mod-stream certbot python3-certbot-nginx
+    apt-get install -y --no-install-recommends nginx libnginx-mod-stream certbot python3-certbot-nginx
     systemctl stop nginx 2>/dev/null || true
 
-    # 4. Docker и Docker Compose через get.docker.com
-    log "4/5. Docker & Docker Compose..."
-    if ! command -v docker >/dev/null 2>&1; then
-        local docker_sh
-        docker_sh="$(mktemp /tmp/get-docker-XXXXXX.sh)"
-        if curl -fsSL https://get.docker.com -o "$docker_sh"; then
-            sh "$docker_sh" >/dev/null 2>&1 || true
-            rm -f "$docker_sh"
-        else
-            warn "get.docker.com недоступен, пробуем установку из apt..."
-            apt-get install -y -qq docker.io docker-compose-v2 || true
+    # 4. Docker и Docker Compose (только если на сервере обнаружен Copyparty)
+    if [[ "$has_copyparty" == "true" ]]; then
+        log "4/5. Docker & Docker Compose для Copyparty..."
+        if ! command -v docker >/dev/null 2>&1; then
+            local docker_sh
+            docker_sh="$(mktemp /tmp/get-docker-XXXXXX.sh)"
+            if curl -fsSL https://get.docker.com -o "$docker_sh"; then
+                sh "$docker_sh" || true
+                rm -f "$docker_sh"
+            else
+                warn "get.docker.com недоступен, пробуем установку из apt..."
+                apt-get install -y --no-install-recommends docker.io docker-compose-v2 || true
+            fi
         fi
+        systemctl enable --now docker || true
+    else
+        log "4/5. Пропуск установки Docker (Copyparty не обнаружен)..."
     fi
-    systemctl enable --now docker || true
 
     # 5. Оптимизация сети (BBR)
     log "5/5. Проверка сетевого тюнинга BBR..."
@@ -679,7 +838,7 @@ unpack_and_deploy() {
     chmod 700 "$staging"
 
     log "Распаковка бандла $source_archive..."
-    tar -xzf "$source_archive" -C "$staging"
+    tar -xf "$source_archive" -C "$staging"
 
     local manifest="$staging/meta/manifest.env"
     [[ -f "$manifest" ]] || die "В архиве отсутствует манифест meta/manifest.env!"
@@ -688,8 +847,8 @@ unpack_and_deploy() {
     source "$manifest"
     ok "Манифест прочитан (создан $PACKED_AT)"
 
-    # 1. Зависимости
-    install_system_dependencies
+    # 1. Зависимости (Docker устанавливается только при HAS_COPYPARTY=true)
+    install_system_dependencies "${HAS_COPYPARTY:-false}"
 
     # 2. Пользователь vpnbot
     if [[ "${HAS_BOT:-false}" == "true" ]]; then
@@ -824,8 +983,9 @@ EOF
         log "Настройка Python .venv для MiddlewareJSON..."
         [[ ! -d "/opt/middlewarejson/.venv" ]] && python3 -m venv /opt/middlewarejson/.venv
         if [[ -f "/opt/middlewarejson/requirements.txt" ]]; then
-            /opt/middlewarejson/.venv/bin/pip install --upgrade pip -q 2>/dev/null || true
-            /opt/middlewarejson/.venv/bin/pip install -r /opt/middlewarejson/requirements.txt -q
+            log "Установка зависимостей MiddlewareJSON (pip)..."
+            /opt/middlewarejson/.venv/bin/pip install --upgrade pip 2>/dev/null || true
+            /opt/middlewarejson/.venv/bin/pip install --no-cache-dir -r /opt/middlewarejson/requirements.txt
         fi
 
         cat << 'EOF' > /etc/systemd/system/middlewarejson.service
@@ -860,8 +1020,9 @@ EOF
         log "Настройка Python .venv для Vpn-Website..."
         [[ ! -d "/opt/vpn-website/.venv" ]] && python3 -m venv /opt/vpn-website/.venv
         if [[ -f "/opt/vpn-website/requirements.txt" ]]; then
-            /opt/vpn-website/.venv/bin/pip install --upgrade pip -q 2>/dev/null || true
-            /opt/vpn-website/.venv/bin/pip install -r /opt/vpn-website/requirements.txt -q
+            log "Установка зависимостей Vpn-Website (pip)..."
+            /opt/vpn-website/.venv/bin/pip install --upgrade pip 2>/dev/null || true
+            /opt/vpn-website/.venv/bin/pip install --no-cache-dir -r /opt/vpn-website/requirements.txt
         fi
 
         cat << 'EOF' > /etc/systemd/system/vpn-website.service
@@ -900,8 +1061,9 @@ EOF
         log "Настройка Python .venv для Vpn-Bot..."
         [[ ! -d "/opt/vpn-bot/.venv" ]] && python3 -m venv /opt/vpn-bot/.venv
         if [[ -f "/opt/vpn-bot/requirements.txt" ]]; then
-            /opt/vpn-bot/.venv/bin/pip install --upgrade pip -q 2>/dev/null || true
-            /opt/vpn-bot/.venv/bin/pip install -r /opt/vpn-bot/requirements.txt -q
+            log "Установка зависимостей Vpn-Bot (pip)..."
+            /opt/vpn-bot/.venv/bin/pip install --upgrade pip 2>/dev/null || true
+            /opt/vpn-bot/.venv/bin/pip install --no-cache-dir -r /opt/vpn-bot/requirements.txt
         fi
 
         chown -R vpnbot:vpnbot /opt/vpn-bot
@@ -1007,63 +1169,57 @@ prompt_3xui_installation() {
 
 # ── 7. Перенос Server-to-Server по SSH (PUSH) ────────────────────────────────
 push_to_target() {
-    local target_ssh="${1:-}"
-    if [[ -z "$target_ssh" ]]; then
-        printf '%s? Введите SSH адрес целевого сервера (например, root@194.87.1.2): %s' "$C_CYAN" "$C_RESET"
-        if [[ -r /dev/tty ]]; then
-            read -r target_ssh < /dev/tty || true
-        else
-            read -r target_ssh || true
-        fi
+    local target_endpoint target_port
+    if [[ -n "${1:-}" ]]; then
+        read -r target_endpoint target_port <<< "$(parse_ssh_endpoint "$1" "${2:-}")"
+    else
+        read -r target_endpoint target_port <<< "$(ask_ssh_endpoint "Введите SSH адрес целевого сервера")"
     fi
-    target_ssh="$(echo "${target_ssh:-}" | tr -d '[:space:]')"
-    [[ -n "$target_ssh" ]] || die "SSH-адрес сервера не указан."
 
     local with_ssh="false"
     with_ssh="$(ask_ssh_transfer)"
 
-    log "Запуск прямого переноса НА $target_ssh (перенос SSH: $with_ssh)..."
+    log "Запуск прямого переноса НА $target_endpoint (порт $target_port, перенос SSH: $with_ssh)..."
+    verify_ssh_connection "$target_endpoint" "$target_port"
+
     scan_components
 
     local tmp_archive="/tmp/caelix_transfer_$(date +%s).tar.gz"
     pack_components "$tmp_archive" "$with_ssh"
 
-    log "Копирование скрипта и архива на $target_ssh..."
-    scp -o StrictHostKeyChecking=accept-new "$0" "${target_ssh}:/tmp/migrate.sh"
-    scp -o StrictHostKeyChecking=accept-new "$tmp_archive" "${target_ssh}:/tmp/caelix-bundle.tar.gz"
+    deploy_remote_script "$target_endpoint" "$target_port"
+    transfer_file "push" "$target_endpoint" "$target_port" "/tmp/caelix-bundle.tar.gz" "$tmp_archive"
     rm -f "$tmp_archive"
 
-    log "Запуск развёртывания на $target_ssh..."
-    ssh -t -o StrictHostKeyChecking=accept-new "$target_ssh" "sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz"
+    log "Запуск развёртывания на $target_endpoint..."
+    ssh -t -p "$target_port" -o StrictHostKeyChecking=accept-new "$target_endpoint" "sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz"
 
-    ok "Миграция на $target_ssh успешно завершена!"
+    ok "Миграция на $target_endpoint успешно завершена!"
 }
 
 # ── 8. Забор данных со старого сервера по SSH (PULL) ─────────────────────────
 pull_from_source() {
-    local source_ssh="${1:-}"
-    if [[ -z "$source_ssh" ]]; then
-        printf '%s? Введите SSH адрес старого сервера (например, root@194.87.1.2): %s' "$C_CYAN" "$C_RESET"
-        if [[ -r /dev/tty ]]; then
-            read -r source_ssh < /dev/tty || true
-        else
-            read -r source_ssh || true
-        fi
+    local source_endpoint source_port
+    if [[ -n "${1:-}" ]]; then
+        read -r source_endpoint source_port <<< "$(parse_ssh_endpoint "$1" "${2:-}")"
+    else
+        read -r source_endpoint source_port <<< "$(ask_ssh_endpoint "Введите SSH адрес старого сервера")"
     fi
-    source_ssh="$(echo "${source_ssh:-}" | tr -d '[:space:]')"
-    [[ -n "$source_ssh" ]] || die "SSH-адрес сервера не указан."
 
     local with_ssh="false"
     with_ssh="$(ask_ssh_transfer)"
 
-    log "Подключение к старому серверу $source_ssh для сбора данных (перенос SSH: $with_ssh)..."
-    scp -o StrictHostKeyChecking=accept-new "$0" "${source_ssh}:/tmp/migrate.sh"
-    ssh -t -o StrictHostKeyChecking=accept-new "$source_ssh" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz $with_ssh"
+    log "Подключение к старому серверу $source_endpoint (порт $source_port, перенос SSH: $with_ssh)..."
+    verify_ssh_connection "$source_endpoint" "$source_port"
+
+    deploy_remote_script "$source_endpoint" "$source_port"
+
+    log "Сборка архива на удаленном сервере ($source_endpoint)..."
+    ssh -t -p "$source_port" -o StrictHostKeyChecking=accept-new "$source_endpoint" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz '$with_ssh'"
 
     local local_archive="/tmp/caelix-bundle.tar.gz"
-    log "Загрузка архива со старого сервера..."
-    scp -o StrictHostKeyChecking=accept-new "${source_ssh}:/tmp/caelix-source-bundle.tar.gz" "$local_archive"
-    ssh -o StrictHostKeyChecking=accept-new "$source_ssh" "rm -f /tmp/migrate.sh /tmp/caelix-source-bundle.tar.gz" 2>/dev/null || true
+    transfer_file "pull" "$source_endpoint" "$source_port" "/tmp/caelix-source-bundle.tar.gz" "$local_archive"
+    ssh -p "$source_port" -o StrictHostKeyChecking=accept-new "$source_endpoint" "rm -f /tmp/migrate.sh /tmp/caelix-source-bundle.tar.gz" 2>/dev/null || true
 
     log "Начало развёртывания на текущем сервере..."
     unpack_and_deploy "$local_archive"
@@ -1250,12 +1406,12 @@ main() {
         push)
             ensure_root
             banner
-            push_to_target "${1:-}"
+            push_to_target "${1:-}" "${2:-}"
             ;;
         pull)
             ensure_root
             banner
-            pull_from_source "${1:-}"
+            pull_from_source "${1:-}" "${2:-}"
             ;;
         pack)
             ensure_root

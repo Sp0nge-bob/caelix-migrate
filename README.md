@@ -52,6 +52,30 @@ bash <(curl -Ls https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main
 
 ---
 
+## 🎯 Выборочная миграция компонентов
+
+В режимах `PUSH`, `PULL`, `PACK` и `UNPACK` перед началом переноса открывается интерактивный выбор компонентов:
+
+- **Номера через пробел (`1 2`)** — переключить галочки `[✔]` / `[ ]` у нужных пунктов.
+- **`only 1 2` (или `=1 2`)** — оставить **только** указанные пункты.
+- **`bw`** — выбрать только `Vpn-Bot` и `Vpn-Website`.
+- **`app`** — выбрать только приложения (`Vpn-Bot`, `Vpn-Website`, `MiddlewareJSON`, `Redis`).
+- **`infra`** — выбрать всё, **кроме** `Vpn-Bot` и `Vpn-Website` (например, `MiddlewareJSON`, `Redis`, `Nginx`, `Copyparty`, `SSL сертификаты`).
+- **`all` / `none`** — отметить всё (без SSH) или снять все галочки.
+- **`Enter`** — подтвердить текущий выбор и продолжить.
+
+Также поддерживаются CLI-флаги `--only` и `--exclude` (значения: `bot`, `web`, `mw`, `redis`, `nginx`, `copyparty`, `certs`, `ssh`):
+
+```bash
+# Перенести только бота и сайт
+sudo bash migrate.sh pull root@OLD_SERVER_IP --only bot,web
+
+# Перенести всё, кроме бота и сайта
+sudo bash migrate.sh push root@NEW_SERVER_IP --exclude bot,web
+```
+
+---
+
 ## 🛠 Режимы работы
 
 ### 1. `[PUSH]` — Перенос на новый сервер со старого

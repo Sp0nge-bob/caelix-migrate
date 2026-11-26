@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.1.4"
+VERSION="1.2.0"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -53,26 +53,6 @@ find_path() {
         fi
     done
     return 0
-}
-
-# ── Опрос переноса SSH настроек ───────────────────────────────────────────────
-ask_ssh_transfer() {
-    printf '\n%s?%s %sПеренести настройки SSH (.ssh/authorized_keys, .ssh/authorized_key и sshd_config)?%s %s[y/N]%s: ' \
-        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
-
-    local raw_ans=""
-    if [[ -r /dev/tty ]]; then
-        read -r raw_ans < /dev/tty || true
-    else
-        read -r raw_ans || true
-    fi
-    local ans
-    ans="$(echo "${raw_ans:-N}" | tr -d '[:space:]')"
-
-    case "$ans" in
-        [yY]|[yY][eE][sS]|[дД]|[дД][аА]) echo "true" ;;
-        *) echo "false" ;;
-    esac
 }
 
 # ── Определение SSH порта ─────────────────────────────────────────────────────
@@ -217,7 +197,7 @@ close_ssh_session() {
 
 # ── Получение локального исполняемого файла скрипта (обход /dev/fd/*) ─────────
 get_runnable_script() {
-    local cached_script="/tmp/caelix-migrate-local.sh"
+    local cached_script="/tmp/caelix-migrate-local-${VERSION}.sh"
     # Если $0 — это реальный файл на диске
     if [[ -f "${BASH_SOURCE[0]:-$0}" && ! "${BASH_SOURCE[0]:-$0}" =~ ^/dev/fd ]]; then
         echo "${BASH_SOURCE[0]:-$0}"
@@ -243,10 +223,16 @@ deploy_remote_script() {
     local_script="$(get_runnable_script)"
 
     log "Доставка скрипта миграции на $endpoint..."
-    local remote_cmd="curl -fsSL https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main/migrate.sh -o /tmp/migrate.sh && chmod +x /tmp/migrate.sh"
-    if ! ssh "${SSH_MUX_OPTS[@]}" "$endpoint" "$remote_cmd" >/dev/null 2>&1; then
-        scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "$local_script" "${endpoint}:/tmp/migrate.sh"
+    if [[ -s "$local_script" ]]; then
+        if scp -o "ControlPath=$SSH_MUX_SOCKET" -P "$port" -o "StrictHostKeyChecking=accept-new" "$local_script" "${endpoint}:/tmp/migrate.sh" >/dev/null 2>&1; then
+            ssh "${SSH_MUX_OPTS[@]}" "$endpoint" "chmod +x /tmp/migrate.sh" >/dev/null 2>&1 || true
+            ok "Скрипт миграции готов на $endpoint (/tmp/migrate.sh)"
+            return 0
+        fi
     fi
+
+    local remote_cmd="curl -fsSL https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main/migrate.sh -o /tmp/migrate.sh && chmod +x /tmp/migrate.sh"
+    ssh "${SSH_MUX_OPTS[@]}" "$endpoint" "$remote_cmd" >/dev/null 2>&1 || die "Не удалось доставить скрипт миграции на $endpoint."
     ok "Скрипт миграции готов на $endpoint (/tmp/migrate.sh)"
 }
 
@@ -504,6 +490,673 @@ scan_components() {
     if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 && "$silent" != "true" ]]; then
         ok "Обнаружены внешние SSL сертификаты: ${#DETECTED_EXTRA_CERTS[@]} шт. вне /root/cert (будут перенесены)"
     fi
+
+    populate_scan_summaries
+}
+
+# ── Хранилище доступности и выбора компонентов ────────────────────────────────
+AVAIL_BOT="false";       INFO_BOT=""
+AVAIL_WEB="false";       INFO_WEB=""
+AVAIL_MW="false";        INFO_MW=""
+AVAIL_REDIS="false";     INFO_REDIS=""
+AVAIL_NGINX="false";     INFO_NGINX=""
+AVAIL_COPYPARTY="false"; INFO_COPYPARTY=""
+AVAIL_CERTS="false";     INFO_CERTS=""
+AVAIL_SSH="false";       INFO_SSH=""
+
+SEL_BOT="false"
+SEL_WEB="false"
+SEL_MW="false"
+SEL_REDIS="false"
+SEL_NGINX="false"
+SEL_COPYPARTY="false"
+SEL_CERTS="false"
+SEL_SSH="false"
+
+CLI_ONLY_COMPONENTS=""
+CLI_EXCLUDE_COMPONENTS=""
+CLI_WITH_SSH="false"
+CLI_UNPACK_ALL="false"
+POSITIONAL_ARGS=()
+
+reset_availability() {
+    AVAIL_BOT="false";       INFO_BOT=""
+    AVAIL_WEB="false";       INFO_WEB=""
+    AVAIL_MW="false";        INFO_MW=""
+    AVAIL_REDIS="false";     INFO_REDIS=""
+    AVAIL_NGINX="false";     INFO_NGINX=""
+    AVAIL_COPYPARTY="false"; INFO_COPYPARTY=""
+    AVAIL_CERTS="false";     INFO_CERTS=""
+    AVAIL_SSH="false";       INFO_SSH=""
+}
+
+reset_component_selection() {
+    SEL_BOT="false"
+    SEL_WEB="false"
+    SEL_MW="false"
+    SEL_REDIS="false"
+    SEL_NGINX="false"
+    SEL_COPYPARTY="false"
+    SEL_CERTS="false"
+    SEL_SSH="false"
+}
+
+get_component_sel() {
+    case "$1" in
+        bot)       echo "$SEL_BOT" ;;
+        web)       echo "$SEL_WEB" ;;
+        mw)        echo "$SEL_MW" ;;
+        redis)     echo "$SEL_REDIS" ;;
+        nginx)     echo "$SEL_NGINX" ;;
+        copyparty) echo "$SEL_COPYPARTY" ;;
+        certs)     echo "$SEL_CERTS" ;;
+        ssh)       echo "$SEL_SSH" ;;
+        *)         echo "false" ;;
+    esac
+}
+
+set_component_sel() {
+    local id="$1"
+    local val="$2"
+    case "$id" in
+        bot)       SEL_BOT="$val" ;;
+        web)       SEL_WEB="$val" ;;
+        mw)        SEL_MW="$val" ;;
+        redis)     SEL_REDIS="$val" ;;
+        nginx)     SEL_NGINX="$val" ;;
+        copyparty) SEL_COPYPARTY="$val" ;;
+        certs)     SEL_CERTS="$val" ;;
+        ssh)       SEL_SSH="$val" ;;
+    esac
+}
+
+is_component_avail() {
+    case "$1" in
+        bot)       [[ "$AVAIL_BOT" == "true" ]] ;;
+        web)       [[ "$AVAIL_WEB" == "true" ]] ;;
+        mw)        [[ "$AVAIL_MW" == "true" ]] ;;
+        redis)     [[ "$AVAIL_REDIS" == "true" ]] ;;
+        nginx)     [[ "$AVAIL_NGINX" == "true" ]] ;;
+        copyparty) [[ "$AVAIL_COPYPARTY" == "true" ]] ;;
+        certs)     [[ "$AVAIL_CERTS" == "true" ]] ;;
+        ssh)       [[ "$AVAIL_SSH" == "true" ]] ;;
+        *)         return 1 ;;
+    esac
+}
+
+get_component_label() {
+    case "$1" in
+        bot)       echo "Vpn-Bot" ;;
+        web)       echo "Vpn-Website" ;;
+        mw)        echo "MiddlewareJSON" ;;
+        redis)     echo "Redis" ;;
+        nginx)     echo "Nginx" ;;
+        copyparty) echo "Copyparty" ;;
+        certs)     echo "SSL сертификаты" ;;
+        ssh)       echo "SSH настройки" ;;
+        *)         echo "$1" ;;
+    esac
+}
+
+get_component_info() {
+    case "$1" in
+        bot)       echo "$INFO_BOT" ;;
+        web)       echo "$INFO_WEB" ;;
+        mw)        echo "$INFO_MW" ;;
+        redis)     echo "$INFO_REDIS" ;;
+        nginx)     echo "$INFO_NGINX" ;;
+        copyparty) echo "$INFO_COPYPARTY" ;;
+        certs)     echo "$INFO_CERTS" ;;
+        ssh)       echo "$INFO_SSH" ;;
+    esac
+}
+
+normalize_component_id() {
+    local raw
+    raw="$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$raw" in
+        bot|vpnbot|vpn-bot)                       echo "bot" ;;
+        web|site|website|vpnwebsite|vpn-website)  echo "web" ;;
+        mw|middleware|middlewarejson)             echo "mw" ;;
+        redis|redis-server)                       echo "redis" ;;
+        nginx)                                    echo "nginx" ;;
+        copyparty|cp)                             echo "copyparty" ;;
+        certs|cert|ssl|tls|letsencrypt)           echo "certs" ;;
+        ssh|sshd)                                 echo "ssh" ;;
+        *)                                        return 1 ;;
+    esac
+}
+
+populate_scan_summaries() {
+    reset_availability
+
+    if [[ -n "$DETECTED_BOT" ]]; then
+        AVAIL_BOT="true"
+        local db_info="нет bot.db"
+        if [[ -f "$DETECTED_BOT/data/bot.db" ]]; then
+            db_info="bot.db: $(du -h "$DETECTED_BOT/data/bot.db" 2>/dev/null | cut -f1 || echo "есть")"
+        fi
+        local env_info="нет"
+        [[ -f "$DETECTED_BOT/.env" ]] && env_info="OK"
+        INFO_BOT="$DETECTED_BOT ($db_info, .env: $env_info)"
+    fi
+
+    if [[ -n "$DETECTED_WEB" ]]; then
+        AVAIL_WEB="true"
+        local env_info="нет"
+        [[ -f "$DETECTED_WEB/.env" ]] && env_info="OK"
+        INFO_WEB="$DETECTED_WEB (.env: $env_info)"
+    fi
+
+    if [[ -n "$DETECTED_MW" ]]; then
+        AVAIL_MW="true"
+        local env_info="нет"
+        [[ -f "$DETECTED_MW/.env" ]] && env_info="OK"
+        INFO_MW="$DETECTED_MW (.env: $env_info)"
+    fi
+
+    if [[ "$DETECTED_REDIS" == "true" ]]; then
+        AVAIL_REDIS="true"
+        INFO_REDIS="redis-server"
+    fi
+
+    if [[ "$DETECTED_NGINX" == "true" ]]; then
+        AVAIL_NGINX="true"
+        local conf_count=0
+        if [[ -d "/etc/nginx/conf.d" ]]; then
+            conf_count="$(find /etc/nginx/conf.d -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)"
+        fi
+        INFO_NGINX="nginx.conf + ${conf_count} файл(ов) в conf.d/"
+    fi
+
+    if [[ -n "$DETECTED_COPYPARTY" ]]; then
+        AVAIL_COPYPARTY="true"
+        local cp_dc="нет"
+        [[ -f "$DETECTED_COPYPARTY/docker-compose.yml" ]] && cp_dc="OK"
+        INFO_COPYPARTY="$DETECTED_COPYPARTY (docker-compose: $cp_dc)"
+    fi
+
+    local certs_parts=()
+    if [[ "$DETECTED_LETSENCRYPT" == "true" ]]; then
+        local le_domains
+        le_domains="$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk -F/ '{print $NF}' | paste -sd, - 2>/dev/null || true)"
+        [[ -z "$le_domains" ]] && le_domains="активен"
+        certs_parts+=("Let's Encrypt: $le_domains")
+    fi
+    if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ]]; then
+        certs_parts+=("${#DETECTED_EXTRA_CERTS[@]} внешних файлов")
+    fi
+    if [[ ${#certs_parts[@]} -gt 0 ]]; then
+        AVAIL_CERTS="true"
+        INFO_CERTS="$(IFS=", "; echo "${certs_parts[*]}")"
+    fi
+
+    local ssh_parts=()
+    if [[ -n "$DETECTED_SSH_AUTHORIZED_KEYS" ]]; then
+        local count_keys
+        count_keys="$(grep -c -E "^(ssh-|ecdsa-|sk-)" "$DETECTED_SSH_AUTHORIZED_KEYS" 2>/dev/null || echo "1+")"
+        ssh_parts+=("authorized_keys ($count_keys)")
+    fi
+    if [[ -n "$DETECTED_SSH_AUTHORIZED_KEY" ]]; then
+        local count_key
+        count_key="$(grep -c -E "^(ssh-|ecdsa-|sk-)" "$DETECTED_SSH_AUTHORIZED_KEY" 2>/dev/null || echo "1+")"
+        ssh_parts+=("authorized_key ($count_key)")
+    fi
+    if [[ "$DETECTED_SSHD_CONF" == "true" ]]; then
+        ssh_parts+=("sshd_config")
+    fi
+    if [[ ${#ssh_parts[@]} -gt 0 ]]; then
+        AVAIL_SSH="true"
+        INFO_SSH="$(IFS=", "; echo "${ssh_parts[*]}")"
+    fi
+}
+
+print_scan_env() {
+    scan_components "true"
+    echo "___CAELIX_SCAN_BEGIN___"
+    printf 'AVAIL_BOT=%s\n' "$AVAIL_BOT"
+    printf 'INFO_BOT=%s\n' "${INFO_BOT//$'\n'/ }"
+    printf 'AVAIL_WEB=%s\n' "$AVAIL_WEB"
+    printf 'INFO_WEB=%s\n' "${INFO_WEB//$'\n'/ }"
+    printf 'AVAIL_MW=%s\n' "$AVAIL_MW"
+    printf 'INFO_MW=%s\n' "${INFO_MW//$'\n'/ }"
+    printf 'AVAIL_REDIS=%s\n' "$AVAIL_REDIS"
+    printf 'INFO_REDIS=%s\n' "${INFO_REDIS//$'\n'/ }"
+    printf 'AVAIL_NGINX=%s\n' "$AVAIL_NGINX"
+    printf 'INFO_NGINX=%s\n' "${INFO_NGINX//$'\n'/ }"
+    printf 'AVAIL_COPYPARTY=%s\n' "$AVAIL_COPYPARTY"
+    printf 'INFO_COPYPARTY=%s\n' "${INFO_COPYPARTY//$'\n'/ }"
+    printf 'AVAIL_CERTS=%s\n' "$AVAIL_CERTS"
+    printf 'INFO_CERTS=%s\n' "${INFO_CERTS//$'\n'/ }"
+    printf 'AVAIL_SSH=%s\n' "$AVAIL_SSH"
+    printf 'INFO_SSH=%s\n' "${INFO_SSH//$'\n'/ }"
+    printf 'DETECTED_XUI=%s\n' "$DETECTED_XUI"
+    echo "___CAELIX_SCAN_END___"
+}
+
+scan_remote_components() {
+    local endpoint="$1"
+    log "Сканирование доступных компонентов на сервере $endpoint..."
+    local raw_out
+    raw_out="$(ssh "${SSH_MUX_OPTS[@]}" "$endpoint" \
+        'if [ "$(id -u)" -eq 0 ]; then bash /tmp/migrate.sh scan --env; else sudo bash /tmp/migrate.sh scan --env; fi' \
+        2>/dev/null | tr -d '\r')" || true
+
+    reset_availability
+    DETECTED_XUI="false"
+
+    local in_block="false"
+    local parsed_any="false"
+    while IFS= read -r line; do
+        if [[ "$line" == "___CAELIX_SCAN_BEGIN___" ]]; then
+            in_block="true"
+            continue
+        elif [[ "$line" == "___CAELIX_SCAN_END___" ]]; then
+            in_block="false"
+            break
+        fi
+        [[ "$in_block" != "true" ]] && continue
+        parsed_any="true"
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        case "$key" in
+            AVAIL_BOT)       AVAIL_BOT="$val" ;;
+            INFO_BOT)        INFO_BOT="$val" ;;
+            AVAIL_WEB)       AVAIL_WEB="$val" ;;
+            INFO_WEB)        INFO_WEB="$val" ;;
+            AVAIL_MW)        AVAIL_MW="$val" ;;
+            INFO_MW)         INFO_MW="$val" ;;
+            AVAIL_REDIS)     AVAIL_REDIS="$val" ;;
+            INFO_REDIS)      INFO_REDIS="$val" ;;
+            AVAIL_NGINX)     AVAIL_NGINX="$val" ;;
+            INFO_NGINX)      INFO_NGINX="$val" ;;
+            AVAIL_COPYPARTY) AVAIL_COPYPARTY="$val" ;;
+            INFO_COPYPARTY)  INFO_COPYPARTY="$val" ;;
+            AVAIL_CERTS)     AVAIL_CERTS="$val" ;;
+            INFO_CERTS)      INFO_CERTS="$val" ;;
+            AVAIL_SSH)       AVAIL_SSH="$val" ;;
+            INFO_SSH)        INFO_SSH="$val" ;;
+            DETECTED_XUI)    DETECTED_XUI="$val" ;;
+        esac
+    done <<< "$raw_out"
+
+    [[ "$parsed_any" == "true" ]] || die "Не удалось получить список компонентов с сервера $endpoint."
+}
+
+parse_component_args() {
+    CLI_ONLY_COMPONENTS=""
+    CLI_EXCLUDE_COMPONENTS=""
+    CLI_WITH_SSH="false"
+    CLI_UNPACK_ALL="false"
+    POSITIONAL_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --only)
+                shift
+                [[ $# -gt 0 ]] || die "Флаг --only требует список компонентов (например: --only bot,web)"
+                CLI_ONLY_COMPONENTS="$1"
+                ;;
+            --only=*)
+                CLI_ONLY_COMPONENTS="${1#--only=}"
+                ;;
+            --exclude)
+                shift
+                [[ $# -gt 0 ]] || die "Флаг --exclude требует список компонентов (например: --exclude bot,web)"
+                CLI_EXCLUDE_COMPONENTS="$1"
+                ;;
+            --exclude=*)
+                CLI_EXCLUDE_COMPONENTS="${1#--exclude=}"
+                ;;
+            --with-ssh)
+                CLI_WITH_SSH="true"
+                ;;
+            --all|--yes|-y)
+                CLI_UNPACK_ALL="true"
+                ;;
+            *)
+                POSITIONAL_ARGS+=("$1")
+                ;;
+        esac
+        shift || true
+    done
+}
+
+apply_cli_component_filters() {
+    local mode="${1:-pack}"
+    reset_component_selection
+
+    # Базовые значения: для pack/push/pull всё найденное кроме ssh; для unpack — всё из архива
+    local cid
+    for cid in bot web mw redis nginx copyparty certs; do
+        if is_component_avail "$cid"; then
+            set_component_sel "$cid" "true"
+        fi
+    done
+    if is_component_avail "ssh"; then
+        if [[ "$mode" == "unpack" || "$CLI_WITH_SSH" == "true" ]]; then
+            set_component_sel "ssh" "true"
+        fi
+    fi
+
+    # --only переопределяет набор полностью
+    if [[ -n "$CLI_ONLY_COMPONENTS" ]]; then
+        reset_component_selection
+        local tokens
+        tokens="$(echo "$CLI_ONLY_COMPONENTS" | tr ',' ' ')"
+        local tok norm
+        for tok in $tokens; do
+            [[ -z "$tok" ]] && continue
+            if norm="$(normalize_component_id "$tok")"; then
+                if is_component_avail "$norm"; then
+                    set_component_sel "$norm" "true"
+                else
+                    warn "Компонент '$norm' не обнаружен и будет пропущен."
+                fi
+            else
+                die "Неизвестный компонент в --only: '$tok' (допустимы: bot, web, mw, redis, nginx, copyparty, certs, ssh)"
+            fi
+        done
+    fi
+
+    # --exclude снимает указанные компоненты
+    if [[ -n "$CLI_EXCLUDE_COMPONENTS" ]]; then
+        local tokens
+        tokens="$(echo "$CLI_EXCLUDE_COMPONENTS" | tr ',' ' ')"
+        local tok norm
+        for tok in $tokens; do
+            [[ -z "$tok" ]] && continue
+            if norm="$(normalize_component_id "$tok")"; then
+                set_component_sel "$norm" "false"
+            else
+                die "Неизвестный компонент в --exclude: '$tok' (допустимы: bot, web, mw, redis, nginx, copyparty, certs, ssh)"
+            fi
+        done
+    fi
+}
+
+selected_components_to_csv() {
+    local out=()
+    local cid
+    for cid in bot web mw redis nginx copyparty certs ssh; do
+        if [[ "$(get_component_sel "$cid")" == "true" ]]; then
+            out+=("$cid")
+        fi
+    done
+    IFS=","
+    echo "${out[*]}"
+}
+
+selected_components_summary() {
+    local out=()
+    local cid
+    for cid in bot web mw redis nginx copyparty certs ssh; do
+        if [[ "$(get_component_sel "$cid")" == "true" ]]; then
+            out+=("$(get_component_label "$cid")")
+        fi
+    done
+    IFS=", "
+    echo "${out[*]}"
+}
+
+count_selected_components() {
+    local cnt=0
+    local cid
+    for cid in bot web mw redis nginx copyparty certs ssh; do
+        if [[ "$(get_component_sel "$cid")" == "true" ]]; then
+            cnt=$((cnt + 1))
+        fi
+    done
+    echo "$cnt"
+}
+
+select_components_interactive() {
+    local mode="${1:-pack}"
+    local title="Выбор компонентов для миграции"
+    if [[ "$mode" == "unpack" ]]; then
+        title="Выбор компонентов из архива для развёртывания"
+    fi
+
+    local item_ids=()
+    local cid
+    for cid in bot web mw redis nginx copyparty certs ssh; do
+        if is_component_avail "$cid"; then
+            item_ids+=("$cid")
+        fi
+    done
+
+    if [[ ${#item_ids[@]} -eq 0 ]]; then
+        err "Не найдено ни одного компонента CaelixFlow для выбора."
+        return 1
+    fi
+
+    while true; do
+        echo >&2
+        printf '%s%s%s\n' "$C_BOLD" "$title" "$C_RESET" >&2
+        printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET" >&2
+
+        local i=0
+        local selected_count=0
+        for cid in "${item_ids[@]}"; do
+            i=$((i + 1))
+            local label info mark
+            label="$(get_component_label "$cid")"
+            info="$(get_component_info "$cid")"
+            if [[ "$(get_component_sel "$cid")" == "true" ]]; then
+                mark="${C_GREEN}[✔]${C_RESET}"
+                selected_count=$((selected_count + 1))
+            else
+                mark="${C_DIM}[ ]${C_RESET}"
+            fi
+            local extra_tag=""
+            if [[ "$cid" == "ssh" && "$mode" != "unpack" ]]; then
+                extra_tag=" ${C_DIM}[по умолч. выкл]${C_RESET}"
+            fi
+            printf '  %s%2d)%s %s %-16s %s%s%s%s\n' \
+                "$C_CYAN" "$i" "$C_RESET" "$mark" "$label" "$C_DIM" "$info" "$C_RESET" "$extra_tag" >&2
+        done
+
+        printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET" >&2
+        printf 'Выбрано: %s%d%s из %d\n' "$C_BOLD" "$selected_count" "$C_RESET" "${#item_ids[@]}" >&2
+
+        # Мягкие подсказки о связях между компонентами
+        if [[ "$SEL_WEB" == "true" && "$SEL_BOT" != "true" ]]; then
+            warn "Подсказка: Vpn-Website использует общую БД из Vpn-Bot (data/bot.db). Если на целевом сервере её нет, отметьте Vpn-Bot."
+        fi
+        if [[ "$SEL_BOT" == "true" && "$AVAIL_REDIS" == "true" && "$SEL_REDIS" != "true" ]]; then
+            warn "Подсказка: Vpn-Bot использует Redis (отметьте Redis, если он ещё не установлен на новом сервере)."
+        fi
+        if [[ "$SEL_NGINX" == "true" && "$AVAIL_CERTS" == "true" && "$SEL_CERTS" != "true" ]]; then
+            warn "Подсказка: конфиги Nginx могут ссылаться на SSL-сертификаты (пункт SSL сертификаты)."
+        fi
+
+        echo >&2
+        printf '%sУправление:%s\n' "$C_BOLD" "$C_RESET" >&2
+        printf '  %s•%s Номера (напр. %s1 2%s)        — переключить [✔]/[ ]\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sonly 1 2%s (или %s=1 2%s)    — выбрать ТОЛЬКО указанные пункты\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sbw%s                      — только Vpn-Bot + Vpn-Website\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sapp%s                     — Бот + Сайт + Middleware + Redis\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sinfra%s                   — всё, КРОМЕ Бота и Сайта\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sall%s / %snone%s              — всё (без SSH) / снять все галочки\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" >&2
+        printf '  %s•%s %sEnter%s                   — подтвердить и продолжить (%s0%s — отмена)\n\n' "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+
+        printf '%sВыбор [Enter = продолжить]: %s' "$C_BOLD" "$C_RESET" >&2
+        local raw_input=""
+        local read_rc=0
+        if [[ -r /dev/tty ]]; then
+            read -r raw_input < /dev/tty || read_rc=$?
+        else
+            read -r raw_input || read_rc=$?
+        fi
+        if [[ "$read_rc" -ne 0 && -z "${raw_input:-}" ]]; then
+            warn "Ввод прерван (EOF). Операция отменена."
+            return 1
+        fi
+        raw_input="$(echo "${raw_input:-}" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+        # Enter — подтверждение
+        if [[ -z "$raw_input" ]]; then
+            if [[ "$selected_count" -eq 0 ]]; then
+                warn "Не выбран ни один компонент. Отметьте хотя бы один пункт или введите 0 для отмены."
+                continue
+            fi
+            return 0
+        fi
+
+        local lower_input
+        lower_input="$(echo "$raw_input" | tr '[:upper:]' '[:lower:]')"
+
+        case "$lower_input" in
+            0|q|quit|exit|cancel)
+                warn "Операция отменена пользователем."
+                return 1
+                ;;
+            all)
+                for cid in "${item_ids[@]}"; do
+                    if [[ "$cid" == "ssh" && "$mode" != "unpack" ]]; then
+                        set_component_sel "$cid" "false"
+                    else
+                        set_component_sel "$cid" "true"
+                    fi
+                done
+                continue
+                ;;
+            all+ssh|allssh)
+                for cid in "${item_ids[@]}"; do
+                    set_component_sel "$cid" "true"
+                done
+                continue
+                ;;
+            none|clear|c)
+                reset_component_selection
+                continue
+                ;;
+            bw|botweb|bot+web)
+                reset_component_selection
+                is_component_avail "bot" && SEL_BOT="true"
+                is_component_avail "web" && SEL_WEB="true"
+                if [[ "$SEL_BOT" != "true" && "$SEL_WEB" != "true" ]]; then
+                    warn "Vpn-Bot и Vpn-Website не обнаружены."
+                fi
+                continue
+                ;;
+            app|apps)
+                reset_component_selection
+                for cid in bot web mw redis; do
+                    is_component_avail "$cid" && set_component_sel "$cid" "true"
+                done
+                continue
+                ;;
+            infra|nobot|no-bot)
+                reset_component_selection
+                for cid in "${item_ids[@]}"; do
+                    if [[ "$cid" != "bot" && "$cid" != "web" && "$cid" != "ssh" ]]; then
+                        set_component_sel "$cid" "true"
+                    fi
+                done
+                continue
+                ;;
+        esac
+
+        # Режим: only ..., =..., +..., -... или обычное переключение
+        local op="toggle"
+        local body="$raw_input"
+        if [[ "$lower_input" == only\ * ]]; then
+            op="only"
+            body="${raw_input#*[Oo][Nn][Ll][Yy]}"
+        elif [[ "$raw_input" == =* ]]; then
+            op="only"
+            body="${raw_input#=}"
+        elif [[ "$raw_input" == +* ]]; then
+            op="on"
+            body="${raw_input#+}"
+        elif [[ "$lower_input" == add\ * ]]; then
+            op="on"
+            body="${raw_input#*[Aa][Dd][Dd]}"
+        elif [[ "$raw_input" == -* ]]; then
+            op="off"
+            body="${raw_input#-}"
+        elif [[ "$lower_input" == del\ * ]]; then
+            op="off"
+            body="${raw_input#*[Dd][Ee][Ll]}"
+        fi
+
+        local tokens
+        tokens="$(echo "$body" | tr ',' ' ')"
+        local resolved_ids=()
+        local valid_all="true"
+        local tok norm idx
+        for tok in $tokens; do
+            [[ -z "$tok" ]] && continue
+            if [[ "$op" == "on" && "$tok" == +* ]]; then
+                tok="${tok#+}"
+            elif [[ "$op" == "off" && "$tok" == -* ]]; then
+                tok="${tok#-}"
+            fi
+            if [[ "$tok" =~ ^[0-9]+$ ]]; then
+                idx=$((tok - 1))
+                if [[ "$idx" -ge 0 && "$idx" -lt ${#item_ids[@]} ]]; then
+                    resolved_ids+=("${item_ids[$idx]}")
+                else
+                    warn "Неверный номер пункта: $tok (доступно 1..${#item_ids[@]})."
+                    valid_all="false"
+                fi
+            elif norm="$(normalize_component_id "$tok")"; then
+                if is_component_avail "$norm"; then
+                    resolved_ids+=("$norm")
+                else
+                    warn "Компонент '$norm' недоступен в текущем списке."
+                    valid_all="false"
+                fi
+            else
+                warn "Неизвестная команда или пункт: '$tok'."
+                valid_all="false"
+            fi
+        done
+
+        [[ "$valid_all" == "false" || ${#resolved_ids[@]} -eq 0 ]] && continue
+
+        if [[ "$op" == "only" ]]; then
+            reset_component_selection
+            for cid in "${resolved_ids[@]}"; do
+                set_component_sel "$cid" "true"
+            done
+        elif [[ "$op" == "on" ]]; then
+            for cid in "${resolved_ids[@]}"; do
+                set_component_sel "$cid" "true"
+            done
+        elif [[ "$op" == "off" ]]; then
+            for cid in "${resolved_ids[@]}"; do
+                set_component_sel "$cid" "false"
+            done
+        else
+            for cid in "${resolved_ids[@]}"; do
+                if [[ "$(get_component_sel "$cid")" == "true" ]]; then
+                    set_component_sel "$cid" "false"
+                else
+                    set_component_sel "$cid" "true"
+                fi
+            done
+        fi
+    done
+}
+
+resolve_component_selection() {
+    local mode="${1:-pack}"
+    apply_cli_component_filters "$mode"
+
+    if [[ "$CLI_UNPACK_ALL" == "true" || -n "$CLI_ONLY_COMPONENTS" || -n "$CLI_EXCLUDE_COMPONENTS" ]]; then
+        local cnt
+        cnt="$(count_selected_components)"
+        [[ "$cnt" -gt 0 ]] || die "После применения фильтра не осталось ни одного компонента."
+        ok "Выбранные компоненты: $(selected_components_summary)"
+        return 0
+    fi
+
+    if [[ -t 0 || -r /dev/tty ]]; then
+        select_components_interactive "$mode" || return 1
+        ok "Выбранные компоненты: $(selected_components_summary)"
+    fi
 }
 
 # ── 2. Режим только аудит (SCAN / DRY RUN) ────────────────────────────────────
@@ -662,7 +1315,35 @@ run_scan_audit() {
 # ── 3. Упаковка в защищённый бандл (PACK) ─────────────────────────────────────
 pack_components() {
     local target_archive="${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}"
-    local with_ssh="${2:-false}"
+    local legacy_with_ssh="${2:-}"
+    if [[ "$legacy_with_ssh" == "true" ]]; then
+        SEL_SSH="true"
+    elif [[ "$legacy_with_ssh" == "false" ]]; then
+        SEL_SSH="false"
+    fi
+
+    local pack_bot="false"
+    local pack_web="false"
+    local pack_mw="false"
+    local pack_redis="false"
+    local pack_nginx="false"
+    local pack_copyparty="false"
+    local pack_ssh="false"
+    local pack_le="false"
+    local pack_extra_certs="false"
+
+    [[ -n "$DETECTED_BOT" && "$SEL_BOT" == "true" ]] && pack_bot="true"
+    [[ -n "$DETECTED_WEB" && "$SEL_WEB" == "true" ]] && pack_web="true"
+    [[ -n "$DETECTED_MW" && "$SEL_MW" == "true" ]] && pack_mw="true"
+    [[ "$DETECTED_REDIS" == "true" && "$SEL_REDIS" == "true" ]] && pack_redis="true"
+    [[ "$DETECTED_NGINX" == "true" && "$SEL_NGINX" == "true" ]] && pack_nginx="true"
+    [[ -n "$DETECTED_COPYPARTY" && "$SEL_COPYPARTY" == "true" ]] && pack_copyparty="true"
+    [[ "$AVAIL_SSH" == "true" && "$SEL_SSH" == "true" ]] && pack_ssh="true"
+    if [[ "$SEL_CERTS" == "true" ]]; then
+        [[ "$DETECTED_LETSENCRYPT" == "true" ]] && pack_le="true"
+        [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ]] && pack_extra_certs="true"
+    fi
+
     local staging
     staging="$(mktemp -d /tmp/caelix_pack_XXXXXX)"
     chmod 700 "$staging"
@@ -675,45 +1356,53 @@ pack_components() {
     {
         echo "# CaelixFlow Migration Manifest"
         echo "PACKED_AT=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-        echo "HAS_BOT=\"$([ -n "$DETECTED_BOT" ] && echo true || echo false)\""
-        echo "HAS_WEB=\"$([ -n "$DETECTED_WEB" ] && echo true || echo false)\""
-        echo "HAS_MW=\"$([ -n "$DETECTED_MW" ] && echo true || echo false)\""
-        echo "HAS_REDIS=\"$DETECTED_REDIS\""
-        echo "HAS_NGINX=\"$DETECTED_NGINX\""
-        echo "HAS_COPYPARTY=\"$([ -n "$DETECTED_COPYPARTY" ] && echo true || echo false)\""
+        echo "HAS_BOT=\"$pack_bot\""
+        echo "HAS_WEB=\"$pack_web\""
+        echo "HAS_MW=\"$pack_mw\""
+        echo "HAS_REDIS=\"$pack_redis\""
+        echo "HAS_NGINX=\"$pack_nginx\""
+        echo "HAS_COPYPARTY=\"$pack_copyparty\""
         echo "HAS_XUI=\"$DETECTED_XUI\""
-        echo "HAS_SSH=\"$with_ssh\""
-        echo "HAS_LETSENCRYPT=\"$([ "$DETECTED_LETSENCRYPT" == "true" ] && echo true || echo false)\""
-        echo "HAS_EXTRA_CERTS=\"$([ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ] && echo true || echo false)\""
+        echo "HAS_SSH=\"$pack_ssh\""
+        echo "HAS_LETSENCRYPT=\"$pack_le\""
+        echo "HAS_EXTRA_CERTS=\"$pack_extra_certs\""
     } > "$manifest"
 
     # 1. VPN-Bot
-    if [[ -n "$DETECTED_BOT" ]]; then
+    if [[ "$pack_bot" == "true" ]]; then
         log "Сбор Vpn-Bot..."
         mkdir -p "$staging/bot"
         if [[ -f "$DETECTED_BOT/.env" ]]; then
             cp -a "$DETECTED_BOT/.env" "$staging/bot/.env"
         fi
+        local bot_db_snapshotted="false"
         if [[ -f "$DETECTED_BOT/data/bot.db" ]]; then
             mkdir -p "$staging/bot/data"
             log "Создание целостного горячего снимка bot.db (sqlite3 backup)..."
             if command -v sqlite3 >/dev/null 2>&1; then
                 sqlite3 "$DETECTED_BOT/data/bot.db" ".backup '$staging/bot/data/bot.db'"
                 sqlite3 "$staging/bot/data/bot.db" "PRAGMA integrity_check;" >/dev/null
+                bot_db_snapshotted="true"
             else
                 cp -a "$DETECTED_BOT/data/bot.db"* "$staging/bot/data/" 2>/dev/null || true
             fi
         fi
         if [[ -d "$DETECTED_BOT/data" ]]; then
             mkdir -p "$staging/bot/data"
-            rsync -a --exclude="*.lock" --exclude="*.sock" "$DETECTED_BOT/data/" "$staging/bot/data/" 2>/dev/null || true
+            if [[ "$bot_db_snapshotted" == "true" ]]; then
+                rsync -a --exclude="*.lock" --exclude="*.sock" --exclude="bot.db*" \
+                    "$DETECTED_BOT/data/" "$staging/bot/data/" 2>/dev/null || true
+            else
+                rsync -a --exclude="*.lock" --exclude="*.sock" \
+                    "$DETECTED_BOT/data/" "$staging/bot/data/" 2>/dev/null || true
+            fi
         fi
         rsync -a --exclude=".venv" --exclude="__pycache__" --exclude=".git" --exclude="data" --exclude=".pytest_cache" \
             "$DETECTED_BOT/" "$staging/bot/app/" 2>/dev/null || true
     fi
 
     # 2. VPN-Website
-    if [[ -n "$DETECTED_WEB" ]]; then
+    if [[ "$pack_web" == "true" ]]; then
         log "Сбор Vpn-Website..."
         mkdir -p "$staging/web"
         if [[ -f "$DETECTED_WEB/.env" ]]; then
@@ -724,7 +1413,7 @@ pack_components() {
     fi
 
     # 3. MiddlewareJSON
-    if [[ -n "$DETECTED_MW" ]]; then
+    if [[ "$pack_mw" == "true" ]]; then
         log "Сбор MiddlewareJSON..."
         mkdir -p "$staging/mw"
         if [[ -f "$DETECTED_MW/.env" ]]; then
@@ -743,22 +1432,28 @@ pack_components() {
     fi
 
     # 4. Nginx (строго конфиги)
-    if [[ "$DETECTED_NGINX" == "true" ]]; then
-        log "Сбор конфигурации Nginx (только nginx.conf и conf.d/*)..."
+    if [[ "$pack_nginx" == "true" ]]; then
+        log "Сбор конфигурации Nginx (nginx.conf, conf.d/*, snippets/streams при наличии)..."
         mkdir -p "$staging/nginx/conf.d"
         [[ -f "/etc/nginx/nginx.conf" ]] && cp -a "/etc/nginx/nginx.conf" "$staging/nginx/"
         [[ -d "/etc/nginx/conf.d" ]] && cp -a /etc/nginx/conf.d/* "$staging/nginx/conf.d/" 2>/dev/null || true
+        for extra_ng_dir in "snippets" "streams"; do
+            if [[ -d "/etc/nginx/$extra_ng_dir" ]]; then
+                mkdir -p "$staging/nginx/$extra_ng_dir"
+                rsync -a "/etc/nginx/$extra_ng_dir/" "$staging/nginx/$extra_ng_dir/" 2>/dev/null || true
+            fi
+        done
     fi
 
     # 5. Copyparty
-    if [[ -n "$DETECTED_COPYPARTY" ]]; then
+    if [[ "$pack_copyparty" == "true" ]]; then
         log "Сбор Copyparty ($DETECTED_COPYPARTY)..."
         mkdir -p "$staging/copyparty"
         rsync -a "$DETECTED_COPYPARTY/" "$staging/copyparty/" 2>/dev/null || true
     fi
 
     # 6. SSH (authorized_keys, authorized_key и sshd_config)
-    if [[ "$with_ssh" == "true" ]]; then
+    if [[ "$pack_ssh" == "true" ]]; then
         log "Сбор настроек SSH (.ssh/authorized_keys, .ssh/authorized_key, sshd_config)..."
         mkdir -p "$staging/ssh"
 
@@ -778,13 +1473,13 @@ pack_components() {
     fi
 
     # 7. SSL/TLS сертификаты (вне /root/cert)
-    if [[ "$DETECTED_LETSENCRYPT" == "true" ]]; then
+    if [[ "$pack_le" == "true" ]]; then
         log "Сбор сертификатов Let's Encrypt (/etc/letsencrypt)..."
         mkdir -p "$staging/certs/letsencrypt"
         rsync -a /etc/letsencrypt/ "$staging/certs/letsencrypt/" 2>/dev/null || true
     fi
 
-    if [[ ${#DETECTED_EXTRA_CERTS[@]} -gt 0 ]]; then
+    if [[ "$pack_extra_certs" == "true" ]]; then
         log "Сбор внешних SSL сертификатов (${#DETECTED_EXTRA_CERTS[@]} файлов)..."
         mkdir -p "$staging/certs/extra"
         for cfile in "${DETECTED_EXTRA_CERTS[@]}"; do
@@ -812,32 +1507,51 @@ pack_components() {
 # ── 4. Установка всех зависимостей на чистом Debian 13 (Trixie) ───────────────
 install_system_dependencies() {
     local has_copyparty="${1:-false}"
+    local need_python="${2:-true}"
+    local need_redis="${3:-true}"
+    local need_nginx="${4:-true}"
     log "Установка системных зависимостей (Debian 13 Trixie)..."
 
     export DEBIAN_FRONTEND=noninteractive
     log "Обновление списка пакетов (apt-get update)..."
     apt-get update
 
-    # 1. Системные утилиты и библиотеки Python
-    log "1/5. Системные пакеты (curl, git, rsync, sqlite3, python3-venv, pigz)..."
+    # 1. Базовые системные утилиты и Python (при необходимости)
+    log "1/5. Системные пакеты (curl, git, rsync, sqlite3, pigz)..."
     apt-get install -y --no-install-recommends \
         curl wget git rsync tar gzip bzip2 xz-utils sudo \
         ca-certificates gnupg lsb-release procps net-tools ufw \
-        sqlite3 jq pigz \
-        python3 python3-venv python3-pip python3-dev \
-        build-essential libffi-dev libssl-dev
+        sqlite3 jq pigz
 
-    # 2. Redis
-    log "2/5. Redis-server..."
-    apt-get install -y --no-install-recommends redis-server
-    systemctl enable --now redis-server || true
+    if [[ "$need_python" == "true" ]]; then
+        log "1.1/5. Python окружение и сборочные зависимости..."
+        apt-get install -y --no-install-recommends \
+            python3 python3-venv python3-pip python3-dev \
+            build-essential libffi-dev libssl-dev
+    fi
 
-    # 3. Nginx и stream модуль (Служба СРАЗУ останавливается!)
-    log "3/5. Nginx + libnginx-mod-stream (с немедленной остановкой для 80 порта)..."
-    apt-get install -y --no-install-recommends nginx libnginx-mod-stream certbot python3-certbot-nginx
-    systemctl stop nginx 2>/dev/null || true
+    # 2. Redis (только если выбран Redis)
+    if [[ "$need_redis" == "true" ]]; then
+        log "2/5. Redis-server..."
+        apt-get install -y --no-install-recommends redis-server
+        systemctl enable --now redis-server || true
+    else
+        log "2/5. Пропуск установки Redis (не выбран)..."
+    fi
 
-    # 4. Docker и Docker Compose (только если на сервере обнаружен Copyparty)
+    # 3. Nginx и stream модуль (только если выбран Nginx; служба СРАЗУ останавливается!)
+    if [[ "$need_nginx" == "true" ]]; then
+        log "3/5. Nginx + libnginx-mod-stream (с немедленной остановкой для 80 порта)..."
+        apt-get install -y --no-install-recommends nginx libnginx-mod-stream certbot python3-certbot-nginx
+        systemctl stop nginx 2>/dev/null || true
+    elif [[ "${HAS_LETSENCRYPT:-false}" == "true" ]]; then
+        log "3/5. Установка certbot для сертификатов Let's Encrypt (Nginx не выбран)..."
+        apt-get install -y --no-install-recommends certbot || true
+    else
+        log "3/5. Пропуск установки Nginx (не выбран)..."
+    fi
+
+    # 4. Docker и Docker Compose (только если на сервере обнаружен и выбран Copyparty)
     if [[ "$has_copyparty" == "true" ]]; then
         log "4/5. Docker & Docker Compose для Copyparty..."
         if ! command -v docker >/dev/null 2>&1; then
@@ -853,7 +1567,7 @@ install_system_dependencies() {
         fi
         systemctl enable --now docker || true
     else
-        log "4/5. Пропуск установки Docker (Copyparty не обнаружен)..."
+        log "4/5. Пропуск установки Docker (Copyparty не выбран)..."
     fi
 
     # 5. Оптимизация сети (BBR)
@@ -866,7 +1580,7 @@ install_system_dependencies() {
         sysctl -p >/dev/null 2>&1 || true
     fi
 
-    ok "Все системные зависимости установлены."
+    ok "Системные зависимости готовы."
 }
 
 # ── Установка системных команд и алиасов консоли ──────────────────────────────
@@ -951,6 +1665,7 @@ EOF
 # ── 5. Развёртывание из архива (UNPACK) ────────────────────────────────────────
 unpack_and_deploy() {
     local source_archive="$1"
+    local skip_select="${2:-false}"
     [[ -f "$source_archive" ]] || die "Архив не найден: $source_archive"
 
     local staging
@@ -967,8 +1682,48 @@ unpack_and_deploy() {
     source "$manifest"
     ok "Манифест прочитан (создан $PACKED_AT)"
 
-    # 1. Зависимости (Docker устанавливается только при HAS_COPYPARTY=true)
-    install_system_dependencies "${HAS_COPYPARTY:-false}"
+    # Заполняем доступность компонентов из архива для возможного выборочного развёртывания
+    reset_availability
+    [[ "${HAS_BOT:-false}" == "true" ]] && { AVAIL_BOT="true"; INFO_BOT="из архива"; }
+    [[ "${HAS_WEB:-false}" == "true" ]] && { AVAIL_WEB="true"; INFO_WEB="из архива"; }
+    [[ "${HAS_MW:-false}" == "true" ]] && { AVAIL_MW="true"; INFO_MW="из архива"; }
+    [[ "${HAS_REDIS:-false}" == "true" ]] && { AVAIL_REDIS="true"; INFO_REDIS="из архива"; }
+    [[ "${HAS_NGINX:-false}" == "true" ]] && { AVAIL_NGINX="true"; INFO_NGINX="из архива"; }
+    [[ "${HAS_COPYPARTY:-false}" == "true" ]] && { AVAIL_COPYPARTY="true"; INFO_COPYPARTY="из архива"; }
+    if [[ "${HAS_LETSENCRYPT:-false}" == "true" || "${HAS_EXTRA_CERTS:-false}" == "true" ]]; then
+        AVAIL_CERTS="true"
+        INFO_CERTS="из архива"
+    fi
+    [[ "${HAS_SSH:-false}" == "true" ]] && { AVAIL_SSH="true"; INFO_SSH="из архива"; }
+
+    if [[ "$skip_select" == "true" ]]; then
+        CLI_UNPACK_ALL="true"
+    fi
+
+    if ! resolve_component_selection "unpack"; then
+        rm -rf "$staging"
+        return 1
+    fi
+
+    [[ "$SEL_BOT" != "true" ]] && HAS_BOT="false"
+    [[ "$SEL_WEB" != "true" ]] && HAS_WEB="false"
+    [[ "$SEL_MW" != "true" ]] && HAS_MW="false"
+    [[ "$SEL_REDIS" != "true" ]] && HAS_REDIS="false"
+    [[ "$SEL_NGINX" != "true" ]] && HAS_NGINX="false"
+    [[ "$SEL_COPYPARTY" != "true" ]] && HAS_COPYPARTY="false"
+    [[ "$SEL_SSH" != "true" ]] && HAS_SSH="false"
+    if [[ "$SEL_CERTS" != "true" ]]; then
+        HAS_LETSENCRYPT="false"
+        HAS_EXTRA_CERTS="false"
+    fi
+
+    local need_python="false"
+    if [[ "${HAS_BOT:-false}" == "true" || "${HAS_WEB:-false}" == "true" || "${HAS_MW:-false}" == "true" ]]; then
+        need_python="true"
+    fi
+
+    # 1. Зависимости (ставятся только нужные для выбранных компонентов)
+    install_system_dependencies "${HAS_COPYPARTY:-false}" "$need_python" "${HAS_REDIS:-false}" "${HAS_NGINX:-false}"
 
     # 2. Пользователь vpnbot
     if [[ "${HAS_BOT:-false}" == "true" ]]; then
@@ -1014,8 +1769,22 @@ EOF
         fi
 
         if [[ -f "$staging/ssh/sshd_config" ]]; then
+            [[ -f /etc/ssh/sshd_config ]] && cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.caelix.bak
             cp -a "$staging/ssh/sshd_config" /etc/ssh/sshd_config
-            ok "Конфигурация SSH (/etc/ssh/sshd_config) обновлена"
+            if command -v sshd >/dev/null 2>&1 && ! sshd -t 2>/dev/null; then
+                warn "Новый /etc/ssh/sshd_config не прошёл проверку sshd -t! Восстанавливаем предыдущий конфиг..."
+                if [[ -f /etc/ssh/sshd_config.caelix.bak ]]; then
+                    cp -a /etc/ssh/sshd_config.caelix.bak /etc/ssh/sshd_config
+                fi
+            else
+                ok "Конфигурация SSH (/etc/ssh/sshd_config) проверена и обновлена"
+                if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "active"; then
+                    local new_ssh_port
+                    new_ssh_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
+                    ufw allow "${new_ssh_port}/tcp" comment "SSH Port TCP" >/dev/null 2>&1 || true
+                    ufw allow "${new_ssh_port}/udp" comment "SSH Port UDP" >/dev/null 2>&1 || true
+                fi
+            fi
         fi
 
         log "Перезапуск службы SSH (systemctl restart ssh sshd)..."
@@ -1025,7 +1794,7 @@ EOF
     fi
 
     # 3.5. Восстановление SSL/TLS сертификатов (вне /root/cert)
-    if [[ -d "$staging/certs/letsencrypt" ]]; then
+    if [[ "${HAS_LETSENCRYPT:-false}" == "true" && -d "$staging/certs/letsencrypt" ]]; then
         log "Восстановление сертификатов Let's Encrypt в /etc/letsencrypt..."
         mkdir -p /etc/letsencrypt
         rsync -a "$staging/certs/letsencrypt/" /etc/letsencrypt/
@@ -1033,7 +1802,7 @@ EOF
         ok "Сертификаты Let's Encrypt успешно восстановлены"
     fi
 
-    if [[ -d "$staging/certs/extra" ]]; then
+    if [[ "${HAS_EXTRA_CERTS:-false}" == "true" && -d "$staging/certs/extra" ]]; then
         log "Восстановление внешних SSL сертификатов..."
         (
             cd "$staging/certs/extra"
@@ -1058,6 +1827,12 @@ EOF
         mkdir -p /etc/nginx/conf.d
         [[ -f "$staging/nginx/nginx.conf" ]] && cp -a "$staging/nginx/nginx.conf" /etc/nginx/
         [[ -d "$staging/nginx/conf.d" ]] && cp -a "$staging/nginx/conf.d/"* /etc/nginx/conf.d/ 2>/dev/null || true
+        for extra_ng_dir in "snippets" "streams"; do
+            if [[ -d "$staging/nginx/$extra_ng_dir" ]]; then
+                mkdir -p "/etc/nginx/$extra_ng_dir"
+                rsync -a "$staging/nginx/$extra_ng_dir/" "/etc/nginx/$extra_ng_dir/" 2>/dev/null || true
+            fi
+        done
 
         log "Проверка синтаксиса Nginx (nginx -t)..."
         if nginx -t 2>/dev/null; then
@@ -1092,11 +1867,18 @@ EOF
     # 6. MiddlewareJSON
     if [[ "${HAS_MW:-false}" == "true" && -d "$staging/mw" ]]; then
         log "Восстановление MiddlewareJSON в /opt/middlewarejson..."
+        systemctl stop middlewarejson 2>/dev/null || true
         mkdir -p /opt/middlewarejson
         [[ -d "$staging/mw/app" ]] && rsync -a "$staging/mw/app/" /opt/middlewarejson/
-        [[ -f "$staging/mw/.env" ]] && cp -a "$staging/mw/.env" /opt/middlewarejson/.env
+        if [[ -f "$staging/mw/.env" ]]; then
+            cp -a "$staging/mw/.env" /opt/middlewarejson/.env
+            chmod 600 /opt/middlewarejson/.env 2>/dev/null || true
+        fi
         if [[ -d "$staging/mw/data" ]]; then
             mkdir -p /opt/middlewarejson/data
+            if [[ -f "$staging/mw/data/middleware.db" && ! -f "$staging/mw/data/middleware.db-wal" ]]; then
+                rm -f /opt/middlewarejson/data/middleware.db-wal /opt/middlewarejson/data/middleware.db-shm /opt/middlewarejson/data/middleware.db-journal 2>/dev/null || true
+            fi
             rsync -a "$staging/mw/data/" /opt/middlewarejson/data/
         fi
 
@@ -1127,57 +1909,31 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl enable --now middlewarejson || true
-        ok "MiddlewareJSON запущен"
+        systemctl enable middlewarejson >/dev/null 2>&1 || true
+        systemctl restart middlewarejson || true
+        ok "MiddlewareJSON настроен и перезапущен"
     fi
 
-    # 7. Vpn-Website
-    if [[ "${HAS_WEB:-false}" == "true" && -d "$staging/web" ]]; then
-        log "Восстановление Vpn-Website в /opt/vpn-website..."
-        mkdir -p /opt/vpn-website
-        [[ -d "$staging/web/app" ]] && rsync -a "$staging/web/app/" /opt/vpn-website/
-        [[ -f "$staging/web/.env" ]] && cp -a "$staging/web/.env" /opt/vpn-website/.env
-
-        log "Настройка Python .venv для Vpn-Website..."
-        [[ ! -d "/opt/vpn-website/.venv" ]] && python3 -m venv /opt/vpn-website/.venv
-        if [[ -f "/opt/vpn-website/requirements.txt" ]]; then
-            sed -i 's|^incy-link-encoder.*|incy-link-encoder @ git+https://github.com/INCY-DEV/incy-link-encoder.git#subdirectory=python|' /opt/vpn-website/requirements.txt
-            log "Установка зависимостей Vpn-Website (pip)..."
-            /opt/vpn-website/.venv/bin/pip install --upgrade pip 2>/dev/null || true
-            /opt/vpn-website/.venv/bin/pip install --no-cache-dir -r /opt/vpn-website/requirements.txt
-        fi
-
-        cat << 'EOF' > /etc/systemd/system/vpn-website.service
-[Unit]
-Description=CaelixFlow VPN Website & User Cabinet
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/vpn-website
-ExecStart=/opt/vpn-website/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
-Restart=always
-RestartSec=5
-TimeoutStopSec=5
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now vpn-website || true
-        ok "Vpn-Website запущен"
-    fi
-
-    # 8. Vpn-Bot
+    # 7. Vpn-Bot (выполняется до Vpn-Website, чтобы общая data/bot.db уже была на месте)
     if [[ "${HAS_BOT:-false}" == "true" && -d "$staging/bot" ]]; then
         log "Восстановление Vpn-Bot в /opt/vpn-bot..."
+        local web_was_active="false"
+        if systemctl is-active --quiet vpn-website 2>/dev/null; then
+            web_was_active="true"
+            systemctl stop vpn-website 2>/dev/null || true
+        fi
+        systemctl stop vpn-bot-web vpn-bot-telegram 2>/dev/null || true
+
         mkdir -p /opt/vpn-bot
         [[ -d "$staging/bot/app" ]] && rsync -a "$staging/bot/app/" /opt/vpn-bot/
-        [[ -f "$staging/bot/.env" ]] && cp -a "$staging/bot/.env" /opt/vpn-bot/.env
+        if [[ -f "$staging/bot/.env" ]]; then
+            cp -a "$staging/bot/.env" /opt/vpn-bot/.env
+        fi
         if [[ -d "$staging/bot/data" ]]; then
             mkdir -p /opt/vpn-bot/data
+            if [[ -f "$staging/bot/data/bot.db" && ! -f "$staging/bot/data/bot.db-wal" ]]; then
+                rm -f /opt/vpn-bot/data/bot.db-wal /opt/vpn-bot/data/bot.db-shm /opt/vpn-bot/data/bot.db-journal 2>/dev/null || true
+            fi
             rsync -a "$staging/bot/data/" /opt/vpn-bot/data/
         fi
 
@@ -1234,46 +1990,149 @@ WantedBy=multi-user.target
 EOF
 
         systemctl daemon-reload
-        systemctl enable --now vpn-bot-web vpn-bot-telegram || true
-        ok "Vpn-Bot запущен"
+        systemctl enable vpn-bot-web vpn-bot-telegram >/dev/null 2>&1 || true
+        systemctl restart vpn-bot-web vpn-bot-telegram || true
+        if [[ "$web_was_active" == "true" && "${HAS_WEB:-false}" != "true" ]]; then
+            systemctl start vpn-website 2>/dev/null || true
+        fi
+        ok "Vpn-Bot настроен и перезапущен"
+    fi
+
+    # 8. Vpn-Website
+    if [[ "${HAS_WEB:-false}" == "true" && -d "$staging/web" ]]; then
+        log "Восстановление Vpn-Website в /opt/vpn-website..."
+        systemctl stop vpn-website 2>/dev/null || true
+        mkdir -p /opt/vpn-website
+        [[ -d "$staging/web/app" ]] && rsync -a "$staging/web/app/" /opt/vpn-website/
+        if [[ -f "$staging/web/.env" ]]; then
+            cp -a "$staging/web/.env" /opt/vpn-website/.env
+            chmod 600 /opt/vpn-website/.env 2>/dev/null || true
+        fi
+
+        log "Настройка Python .venv для Vpn-Website..."
+        [[ ! -d "/opt/vpn-website/.venv" ]] && python3 -m venv /opt/vpn-website/.venv
+        if [[ -f "/opt/vpn-website/requirements.txt" ]]; then
+            sed -i 's|^incy-link-encoder.*|incy-link-encoder @ git+https://github.com/INCY-DEV/incy-link-encoder.git#subdirectory=python|' /opt/vpn-website/requirements.txt
+            log "Установка зависимостей Vpn-Website (pip)..."
+            /opt/vpn-website/.venv/bin/pip install --upgrade pip 2>/dev/null || true
+            /opt/vpn-website/.venv/bin/pip install --no-cache-dir -r /opt/vpn-website/requirements.txt
+        fi
+
+        cat << 'EOF' > /etc/systemd/system/vpn-website.service
+[Unit]
+Description=CaelixFlow VPN Website & User Cabinet
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vpn-website
+ExecStart=/opt/vpn-website/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable vpn-website >/dev/null 2>&1 || true
+        systemctl restart vpn-website || true
+        ok "Vpn-Website настроен и перезапущен"
     fi
 
     # 9. Системные команды и алиасы консоли
     install_system_aliases_and_commands
 
     rm -rf "$staging"
+
+    # Проверка статуса развёрнутых служб
+    local check_services=()
+    [[ "${HAS_REDIS:-false}" == "true" ]] && check_services+=("redis-server")
+    [[ "${HAS_MW:-false}" == "true" ]] && check_services+=("middlewarejson")
+    [[ "${HAS_WEB:-false}" == "true" ]] && check_services+=("vpn-website")
+    [[ "${HAS_BOT:-false}" == "true" ]] && check_services+=("vpn-bot-web" "vpn-bot-telegram")
+
+    local all_healthy="true"
+    if [[ ${#check_services[@]} -gt 0 ]]; then
+        sleep 2
+        echo
+        printf '%sПроверка состояния развёрнутых служб:%s\n' "$C_BOLD" "$C_RESET"
+        local svc
+        for svc in "${check_services[@]}"; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                printf '  %s[✔]%s %-20s активна\n' "$C_GREEN" "$C_RESET" "$svc"
+            else
+                printf '  %s[ERR]%s %-18s не запустилась (лог: journalctl -u %s -n 20 --no-pager)\n' \
+                    "$C_RED" "$C_RESET" "$svc" "$svc"
+                all_healthy="false"
+            fi
+        done
+    fi
+
     echo
-    ok "=========================================================="
-    ok "  Все перенесённые службы успешно развёрнуты и запущены!  "
-    ok "=========================================================="
-    printf '\n%sКоманды управления службами в консоли:%s\n' "$C_BOLD" "$C_RESET"
-    printf '  • Бот:    %svpnplategabot%s  (или %sbot%s, %sbot-status%s, %sbot-restart%s, %sbot-logs%s)\n' \
-        "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf '  • Сайт:   %svpnwebsite%s     (или %sweb%s, %sweb-status%s, %sweb-restart%s, %sweb-logs%s)\n' \
-        "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf '  • Общее:  %scaelix-status%s, %scaelix-restart%s\n\n' \
-        "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    if [[ "$all_healthy" == "true" ]]; then
+        ok "=========================================================="
+        ok "  Все выбранные службы успешно развёрнуты и запущены!    "
+        ok "=========================================================="
+    else
+        warn "=========================================================="
+        warn "  Развёртывание завершено, но есть службы с ошибкой старта "
+        warn "=========================================================="
+    fi
+    if [[ "${HAS_BOT:-false}" == "true" || "${HAS_WEB:-false}" == "true" ]]; then
+        printf '\n%sКоманды управления службами в консоли:%s\n' "$C_BOLD" "$C_RESET"
+        if [[ "${HAS_BOT:-false}" == "true" ]]; then
+            printf '  • Бот:    %svpnplategabot%s  (или %sbot%s, %sbot-status%s, %sbot-restart%s, %sbot-logs%s)\n' \
+                "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+        fi
+        if [[ "${HAS_WEB:-false}" == "true" ]]; then
+            printf '  • Сайт:   %svpnwebsite%s     (или %sweb%s, %sweb-status%s, %sweb-restart%s, %sweb-logs%s)\n' \
+                "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+        fi
+        printf '  • Общее:  %scaelix-status%s, %scaelix-restart%s\n\n' \
+            "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    fi
 
     # 8. Настройка и включение UFW фаервола
-    local target_ssh_port
-    target_ssh_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
-    log "Настройка фаервола UFW (SSH порт: $target_ssh_port/tcp+udp, веб-порты: 80/tcp, 443/tcp, 443/udp)..."
-
-    printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
-        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-
-    local raw_extra_ports=""
-    if [[ -r /dev/tty ]]; then
-        read -r raw_extra_ports < /dev/tty || true
-    else
-        read -r raw_extra_ports || true
+    local configure_ufw="true"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "active"; then
+        printf '\n%s?%s %sUFW фаервол уже активен на этом сервере. Обновить/добавить базовые правила (SSH, 80, 443)?%s %s[y/N]%s: ' \
+            "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+        local raw_ufw_ans=""
+        if [[ -r /dev/tty ]]; then read -r raw_ufw_ans < /dev/tty || true; else read -r raw_ufw_ans || true; fi
+        local ufw_ans
+        ufw_ans="$(echo "${raw_ufw_ans:-N}" | tr -d '[:space:]')"
+        case "$ufw_ans" in
+            [yY]|[yY][eE][sS]|[дД]|[дД][аА]) configure_ufw="true" ;;
+            *) configure_ufw="false"; log "Пропуск изменения правил UFW (текущие правила сохранены)." ;;
+        esac
     fi
-    local extra_ports
-    extra_ports="$(echo "$raw_extra_ports" | tr -d '\r\n')"
 
-    setup_ufw_firewall "$target_ssh_port" "$extra_ports"
+    if [[ "$configure_ufw" == "true" ]]; then
+        local target_ssh_port
+        target_ssh_port="$(detect_ssh_port "/etc/ssh/sshd_config")"
+        log "Настройка фаервола UFW (SSH порт: $target_ssh_port/tcp+udp, веб-порты: 80/tcp, 443/tcp, 443/udp)..."
 
-    prompt_3xui_installation
+        printf '\n%s?%s %sУкажите дополнительные порты для UFW (через пробел, например: 2053 8443) или Enter для пропуска:%s ' \
+            "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+
+        local raw_extra_ports=""
+        if [[ -r /dev/tty ]]; then
+            read -r raw_extra_ports < /dev/tty || true
+        else
+            read -r raw_extra_ports || true
+        fi
+        local extra_ports
+        extra_ports="$(echo "$raw_extra_ports" | tr -d '\r\n')"
+
+        setup_ufw_firewall "$target_ssh_port" "$extra_ports"
+    fi
+
+    if ! systemctl is-active --quiet x-ui 2>/dev/null && [[ ! -f /etc/x-ui/x-ui.db ]]; then
+        prompt_3xui_installation
+    fi
 }
 
 # ── 6. Интерактивный опрос и запуск мастера 3x-ui ───────────────────────────
@@ -1312,24 +2171,24 @@ push_to_target() {
         read -r target_endpoint target_port <<< "$(ask_ssh_endpoint "Введите SSH адрес целевого сервера")"
     fi
 
-    local with_ssh="false"
-    with_ssh="$(ask_ssh_transfer)"
+    scan_components "true"
+    resolve_component_selection "pack" || return 1
 
-    log "Запуск прямого переноса НА $target_endpoint (порт $target_port, перенос SSH: $with_ssh)..."
+    log "Запуск переноса НА $target_endpoint (порт $target_port): $(selected_components_summary)..."
     init_ssh_session "$target_endpoint" "$target_port"
     trap 'close_ssh_session "$target_endpoint" "$target_port"' EXIT INT TERM
 
-    scan_components
-
     local tmp_archive="/tmp/caelix_transfer_$(date +%s).tar.gz"
-    pack_components "$tmp_archive" "$with_ssh"
+    pack_components "$tmp_archive"
 
     deploy_remote_script "$target_endpoint" "$target_port"
     transfer_file "push" "$target_endpoint" "$target_port" "/tmp/caelix-bundle.tar.gz" "$tmp_archive"
     rm -f "$tmp_archive"
 
     log "Запуск развёртывания на $target_endpoint..."
-    ssh -t "${SSH_MUX_OPTS[@]}" "$target_endpoint" "sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz"
+    ssh -t "${SSH_MUX_OPTS[@]}" "$target_endpoint" \
+        'if [ "$(id -u)" -eq 0 ]; then bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz --all; else sudo bash /tmp/migrate.sh unpack /tmp/caelix-bundle.tar.gz --all; fi'
+    ssh "${SSH_MUX_OPTS[@]}" "$target_endpoint" "rm -f /tmp/migrate.sh /tmp/caelix-bundle.tar.gz" 2>/dev/null || true
 
     close_ssh_session "$target_endpoint" "$target_port"
     trap - EXIT INT TERM
@@ -1346,17 +2205,26 @@ pull_from_source() {
         read -r source_endpoint source_port <<< "$(ask_ssh_endpoint "Введите SSH адрес старого сервера")"
     fi
 
-    local with_ssh="false"
-    with_ssh="$(ask_ssh_transfer)"
-
-    log "Подключение к старому серверу $source_endpoint (порт $source_port, перенос SSH: $with_ssh)..."
+    log "Подключение к старому серверу $source_endpoint (порт $source_port)..."
     init_ssh_session "$source_endpoint" "$source_port"
     trap 'close_ssh_session "$source_endpoint" "$source_port"' EXIT INT TERM
 
     deploy_remote_script "$source_endpoint" "$source_port"
+    scan_remote_components "$source_endpoint"
 
-    log "Сборка архива на удаленном сервере ($source_endpoint)..."
-    ssh -t "${SSH_MUX_OPTS[@]}" "$source_endpoint" "sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz '$with_ssh'"
+    if ! resolve_component_selection "pack"; then
+        ssh "${SSH_MUX_OPTS[@]}" "$source_endpoint" "rm -f /tmp/migrate.sh" 2>/dev/null || true
+        close_ssh_session "$source_endpoint" "$source_port"
+        trap - EXIT INT TERM
+        return 1
+    fi
+
+    local selected_csv
+    selected_csv="$(selected_components_to_csv)"
+
+    log "Сборка архива на удаленном сервере ($source_endpoint): $(selected_components_summary)..."
+    ssh -t "${SSH_MUX_OPTS[@]}" "$source_endpoint" \
+        "if [ \"\$(id -u)\" -eq 0 ]; then bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz --only '$selected_csv'; else sudo bash /tmp/migrate.sh pack /tmp/caelix-source-bundle.tar.gz --only '$selected_csv'; fi"
 
     local local_archive="/tmp/caelix-bundle.tar.gz"
     transfer_file "pull" "$source_endpoint" "$source_port" "/tmp/caelix-source-bundle.tar.gz" "$local_archive"
@@ -1366,7 +2234,7 @@ pull_from_source() {
     trap - EXIT INT TERM
 
     log "Начало развёртывания на текущем сервере..."
-    unpack_and_deploy "$local_archive"
+    unpack_and_deploy "$local_archive" "true"
     rm -f "$local_archive"
 }
 
@@ -1447,9 +2315,9 @@ interactive_menu() {
             echo
         fi
 
-        printf '  %s1)%s  %s[PUSH]%s      Перенести этот сервер НА другой (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s2)%s  %s[PULL]%s      Забрать данные СО старого сервера (указать IP)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s3)%s  %s[PACK]%s      Создать локальный .tar.gz архив (бэкап)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s1)%s  %s[PUSH]%s      Перенести этот сервер НА другой (с выбором компонентов)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s2)%s  %s[PULL]%s      Забрать данные СО старого сервера (с выбором компонентов)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s3)%s  %s[PACK]%s      Создать локальный .tar.gz архив (с выбором компонентов)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s4)%s  %s[UNPACK]%s    Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s5)%s  %s[SCAN]%s      Проверить, что будет перенесено (Dry Run, только аудит)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s6)%s  %s[IPLENSE]%s   Проверить IP адрес и чистоту сети (iplense.cc)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
@@ -1470,16 +2338,34 @@ interactive_menu() {
         case "$choice" in
             1)
                 ensure_root
-                push_to_target
-                break
+                CLI_ONLY_COMPONENTS=""
+                CLI_EXCLUDE_COMPONENTS=""
+                CLI_WITH_SSH="false"
+                CLI_UNPACK_ALL="false"
+                if push_to_target; then
+                    break
+                fi
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
             2)
                 ensure_root
-                pull_from_source
-                break
+                CLI_ONLY_COMPONENTS=""
+                CLI_EXCLUDE_COMPONENTS=""
+                CLI_WITH_SSH="false"
+                CLI_UNPACK_ALL="false"
+                if pull_from_source; then
+                    break
+                fi
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
             3)
                 ensure_root
+                CLI_ONLY_COMPONENTS=""
+                CLI_EXCLUDE_COMPONENTS=""
+                CLI_WITH_SSH="false"
+                CLI_UNPACK_ALL="false"
                 local out=""
                 printf '%sПуть для архива [/root/caelix-migration-%s.tar.gz]: %s' "$C_CYAN" "$(date +%Y%m%d_%H%M%S)" "$C_RESET"
                 if [[ -r /dev/tty ]]; then
@@ -1490,16 +2376,19 @@ interactive_menu() {
                 out="$(echo "$out" | tr -d '[:space:]')"
                 [[ -z "$out" ]] && out="/root/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz"
 
-                local with_ssh="false"
-                with_ssh="$(ask_ssh_transfer)"
-
-                scan_components
-                pack_components "$out" "$with_ssh"
+                scan_components "true"
+                if resolve_component_selection "pack"; then
+                    pack_components "$out"
+                fi
                 printf '\nНажмите Enter, чтобы продолжить...'
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
             4)
                 ensure_root
+                CLI_ONLY_COMPONENTS=""
+                CLI_EXCLUDE_COMPONENTS=""
+                CLI_WITH_SSH="false"
+                CLI_UNPACK_ALL="false"
                 local in_file=""
                 local latest_default
                 latest_default="$(find /root /tmp -maxdepth 2 -name "caelix-*.tar.gz" 2>/dev/null | head -1 || true)"
@@ -1511,8 +2400,11 @@ interactive_menu() {
                 fi
                 in_file="$(echo "$in_file" | tr -d '[:space:]')"
                 [[ -z "$in_file" ]] && in_file="$latest_default"
-                unpack_and_deploy "$in_file"
-                break
+                if unpack_and_deploy "$in_file"; then
+                    break
+                fi
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
             5)
                 run_scan_audit
@@ -1550,25 +2442,40 @@ main() {
         push)
             ensure_root
             banner
-            push_to_target "${1:-}" "${2:-}"
+            parse_component_args "$@"
+            push_to_target "${POSITIONAL_ARGS[0]:-}" "${POSITIONAL_ARGS[1]:-}"
             ;;
         pull)
             ensure_root
             banner
-            pull_from_source "${1:-}" "${2:-}"
+            parse_component_args "$@"
+            pull_from_source "${POSITIONAL_ARGS[0]:-}" "${POSITIONAL_ARGS[1]:-}"
             ;;
         pack)
             ensure_root
             banner
-            scan_components
-            pack_components "${1:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}" "${2:-false}"
+            parse_component_args "$@"
+            local pack_out="${POSITIONAL_ARGS[0]:-/tmp/caelix-migration-$(date +%Y%m%d_%H%M%S).tar.gz}"
+            local legacy_ssh="${POSITIONAL_ARGS[1]:-}"
+            if [[ "$legacy_ssh" == "true" || "$legacy_ssh" == "false" ]]; then
+                CLI_WITH_SSH="$legacy_ssh"
+                CLI_UNPACK_ALL="true"
+            fi
+            scan_components "true"
+            resolve_component_selection "pack" || exit 1
+            pack_components "$pack_out"
             ;;
         unpack)
             ensure_root
             banner
-            unpack_and_deploy "${1:-}"
+            parse_component_args "$@"
+            unpack_and_deploy "${POSITIONAL_ARGS[0]:-}"
             ;;
         scan)
+            if [[ "${1:-}" == "--env" ]]; then
+                print_scan_env
+                return 0
+            fi
             banner
             if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
                 warn "Скрипт запущен без прав root. Некоторые пути могут быть недоступны для проверки."
@@ -1603,7 +2510,7 @@ main() {
         *)
             banner
             err "Неизвестная команда: $cmd"
-            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip|speed]"
+            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip|speed] [--only bot,web] [--exclude bot,web]"
             exit 1
             ;;
     esac

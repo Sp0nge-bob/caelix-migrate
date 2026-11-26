@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -319,6 +319,123 @@ setup_ufw_firewall() {
     echo
     ufw status
     echo
+}
+
+# ── Настройка локального шифрованного DoT DNS-кэша (unbound) ───────────────────
+setup_unbound_dot_dns() {
+    log "Настройка локального шифрованного DoT DNS-кэша (unbound на 127.0.0.1:53)..."
+
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v unbound >/dev/null 2>&1 || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
+        log "Установка пакетов unbound и ca-certificates..."
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends unbound ca-certificates dnsutils || \
+            apt-get install -y -qq --no-install-recommends unbound ca-certificates
+    fi
+
+    local cert_bundle="/etc/ssl/certs/ca-certificates.crt"
+    if [[ ! -f "$cert_bundle" && -f /etc/ssl/certs/ca-bundle.crt ]]; then
+        cert_bundle="/etc/ssl/certs/ca-bundle.crt"
+    fi
+    [[ -f "$cert_bundle" ]] || die "Не найден системный CA bundle для проверки TLS (DoT)."
+
+    # Освобождаем порт 53 от stub-listener systemd-resolved, если он активен (например, на Ubuntu)
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        log "Отключение DNSStubListener у systemd-resolved для освобождения 53 порта..."
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat << 'EOF' > /etc/systemd/resolved.conf.d/no-stub.conf
+[Resolve]
+DNSStubListener=no
+EOF
+        systemctl restart systemd-resolved 2>/dev/null || true
+    fi
+
+    # Бэкап /etc/resolv.conf до любых правок
+    if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+        local resolv_bak
+        resolv_bak="/root/resolv.conf.bak.$(date +%Y%m%d_%H%M%S)"
+        cp -aL /etc/resolv.conf "$resolv_bak" 2>/dev/null || cp -a /etc/resolv.conf "$resolv_bak" 2>/dev/null || true
+        ok "Сохранён бэкап /etc/resolv.conf -> $resolv_bak"
+    fi
+
+    mkdir -p /etc/unbound/unbound.conf.d
+    cat << EOF > /etc/unbound/unbound.conf.d/dot-cache.conf
+server:
+    interface: 127.0.0.1
+    port: 53
+    access-control: 127.0.0.0/8 allow
+    access-control: 0.0.0.0/0 refuse
+    do-ip4: yes
+    do-ip6: no
+    do-udp: yes
+    do-tcp: yes
+    tls-cert-bundle: "${cert_bundle}"
+    prefetch: yes
+    cache-min-ttl: 60
+    cache-max-ttl: 3600
+    serve-expired: yes
+    serve-expired-ttl: 86400
+    msg-cache-size: 16m
+    rrset-cache-size: 32m
+    num-threads: 1
+    hide-identity: yes
+    hide-version: yes
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    forward-addr: 1.1.1.1@853#cloudflare-dns.com
+    forward-addr: 8.8.8.8@853#dns.google
+    forward-addr: 9.9.9.9@853#dns.quad9.net
+EOF
+
+    unbound-checkconf || die "Ошибка в конфигурации unbound (/etc/unbound/unbound.conf.d/dot-cache.conf)."
+
+    systemctl enable unbound >/dev/null 2>&1 || true
+    systemctl restart unbound
+
+    # Проверяем резолв через 127.0.0.1 ДО переключения /etc/resolv.conf
+    local test_ok="false"
+    local attempt
+    for attempt in 1 2 3; do
+        if command -v nslookup >/dev/null 2>&1; then
+            if nslookup -type=A cloudflare.com 127.0.0.1 >/dev/null 2>&1; then
+                test_ok="true"
+                break
+            fi
+        elif command -v dig >/dev/null 2>&1; then
+            if dig @127.0.0.1 +short A cloudflare.com | grep -qE '^[0-9]+\.'; then
+                test_ok="true"
+                break
+            fi
+        elif command -v python3 >/dev/null 2>&1; then
+            if python3 -c "import socket,struct; s=socket.socket(2,2); s.settimeout(3); s.sendto(b'\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0acloudflare\x03com\x00\x00\x01\x00\x01',('127.0.0.1',53)); d,_=s.recvfrom(512); assert len(d)>12 and (d[3]&0x0f)==0" 2>/dev/null; then
+                test_ok="true"
+                break
+            fi
+        else
+            test_ok="true"
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$test_ok" != "true" ]]; then
+        err "unbound запущен, но тестовый DoT-запрос на 127.0.0.1:53 не прошёл. /etc/resolv.conf не изменён."
+        return 1
+    fi
+
+    # Переключаем системный резолвер на 127.0.0.1 (снимаем symlink, если был)
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+    cat << 'EOF' > /etc/resolv.conf
+nameserver 127.0.0.1
+options timeout:2 attempts:2
+EOF
+
+    ok "Локальный DoT DNS-кэш (unbound 127.0.0.1:53) настроен и активен!"
+    log "Апстримы DoT (853): 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9)."
 }
 
 # ── 1. Сканирование и автоопределение компонентов ─────────────────────────────
@@ -1308,6 +1425,15 @@ run_scan_audit() {
     printf '  %s[i]%s %-16s %s (SSH порт: %s/tcp+udp, веб-порты: 80/tcp, 443/tcp+udp)\n' \
         "$C_CYAN" "$C_RESET" "UFW фаервол" "$ufw_status" "$detected_ssh_port_scan"
 
+    # DoT DNS-кэш диагностика
+    local dot_status="не настроен"
+    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && systemctl is-active --quiet unbound 2>/dev/null; then
+        dot_status="активен (unbound DoT 127.0.0.1:53)"
+    elif command -v unbound >/dev/null 2>&1; then
+        dot_status="unbound установлен, dot-cache.conf не настроен"
+    fi
+    printf '  %s[i]%s %-16s %s\n' "$C_CYAN" "$C_RESET" "DoT DNS-кэш" "$dot_status"
+
     printf '%s──────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
     printf 'Готовность к миграции: обнаружено %s ключевых компонентов.\n' "$count"
 }
@@ -2130,9 +2256,40 @@ EOF
         setup_ufw_firewall "$target_ssh_port" "$extra_ports"
     fi
 
+    prompt_unbound_dot_installation
+
     if ! systemctl is-active --quiet x-ui 2>/dev/null && [[ ! -f /etc/x-ui/x-ui.db ]]; then
         prompt_3xui_installation
     fi
+}
+
+# ── Интерактивное предложение настройки DoT DNS-кэша (unbound) ────────────────
+prompt_unbound_dot_installation() {
+    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && systemctl is-active --quiet unbound 2>/dev/null; then
+        ok "Локальный DoT DNS-кэш (unbound 127.0.0.1:53) уже активен."
+        return 0
+    fi
+
+    printf '\n%s?%s %sНастроить локальный шифрованный DoT DNS-кэш (unbound на 127.0.0.1:53)?%s %s[Y/n]%s: ' \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+
+    local raw_answer=""
+    if [[ -r /dev/tty ]]; then
+        read -r raw_answer < /dev/tty || true
+    else
+        read -r raw_answer || true
+    fi
+    local answer
+    answer="$(echo "${raw_answer:-Y}" | tr -d '[:space:]')"
+
+    case "$answer" in
+        [nN]|[nN][oO]|[нН]|[нН][еЕ][тТ])
+            log "Пропуск настройки DoT DNS-кэша. Вы можете настроить его позже командой: sudo bash $0 dns"
+            ;;
+        *)
+            setup_unbound_dot_dns || warn "Не удалось настроить unbound DoT DNS-кэш (продолжаем)."
+            ;;
+    esac
 }
 
 # ── 6. Интерактивный опрос и запуск мастера 3x-ui ───────────────────────────
@@ -2321,11 +2478,12 @@ interactive_menu() {
         printf '  %s4)%s  %s[UNPACK]%s    Развернуть систему из локального архива\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s5)%s  %s[SCAN]%s      Проверить, что будет перенесено (Dry Run, только аудит)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s6)%s  %s[IPLENSE]%s   Проверить IP адрес и чистоту сети (iplense.cc)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %s7)%s  %s[SPEEDTEST]%s Измерение скорости интернета (speedtest-cli)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s7)%s  %s[SPEEDTEST]%s Измерение скорости интернета (speedtest-cli)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '  %s8)%s  %s[DNS-DOT]%s   Настроить локальный DoT DNS-кэш (unbound 127.0.0.1:53)\n\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '  %s0)%s  Выход\n\n' "$C_DIM" "$C_RESET"
 
         local raw_choice=""
-        printf '%sВыберите действие [0-7]: %s' "$C_BOLD" "$C_RESET"
+        printf '%sВыберите действие [0-8]: %s' "$C_BOLD" "$C_RESET"
         if [[ -r /dev/tty ]]; then
             read -r raw_choice < /dev/tty || true
         else
@@ -2421,6 +2579,12 @@ interactive_menu() {
                 printf '\nНажмите Enter, чтобы вернуться в меню...'
                 if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
                 ;;
+            8)
+                ensure_root
+                setup_unbound_dot_dns
+                printf '\nНажмите Enter, чтобы вернуться в меню...'
+                if [[ -r /dev/tty ]]; then read -r _ < /dev/tty || true; else read -r _ || true; fi
+                ;;
             0|q|Q)
                 echo "Выход."
                 exit 0
@@ -2490,6 +2654,11 @@ main() {
             banner
             run_speedtest "$@"
             ;;
+        dns|dot|dns-dot)
+            ensure_root
+            banner
+            setup_unbound_dot_dns
+            ;;
         ufw)
             ensure_root
             banner
@@ -2510,7 +2679,7 @@ main() {
         *)
             banner
             err "Неизвестная команда: $cmd"
-            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|ip|speed] [--only bot,web] [--exclude bot,web]"
+            echo "Использование: sudo bash $0 [push|pull|pack|unpack|scan|ufw|dns|ip|speed] [--only bot,web] [--exclude bot,web]"
             exit 1
             ;;
     esac

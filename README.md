@@ -27,6 +27,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main
   5)  [SCAN]      Проверить, что будет перенесено (Dry Run, только аудит)
   6)  [IPLENSE]   Проверить IP адрес и чистоту сети (iplense.cc)
   7)  [SPEEDTEST] Измерение скорости интернета (speedtest-cli)
+  8)  [DNS-DOT]   Настроить локальный DoT DNS-кэш (unbound 127.0.0.1:53)
 
   0)  Выход
 ```
@@ -48,6 +49,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Sp0nge-bob/caelix-migrate/main
 | **SSH настройки** | `.ssh/authorized_keys`, `.ssh/authorized_key` и `/etc/ssh/sshd_config` (опционально по вопросу `[y/N]`) | Восстановление ключей и конфига с правами `600`, рестарт служб `ssh` и `sshd` |
 | **SSL/TLS сертификаты** | Сертификаты Let's Encrypt (`/etc/letsencrypt`) и внешние сертификаты (найденные в Nginx или `3x-ui` вне `/root/cert`) | Восстановление структуры каталогов, сохранение symlink-цепочек, права `600`/`644` до проверки `nginx -t` |
 | **UFW Фаервол** | Автоматическая установка и настройка | Открытие портов `80/tcp`, `443/tcp`, `443/udp` и SSH-порта (`tcp` и `udp`, автоопределение из конфига или 22), запрос доп. портов, включение |
+| **DoT DNS-кэш (`unbound`)** | Локальный шифрованный резолвер (опционально `[Y/n]` при деплое или отдельно `migrate.sh dns`) | Установка `unbound` (`127.0.0.1:53`), DoT (`853`) на `1.1.1.1`, `8.8.8.8`, `9.9.9.9` с проверкой TLS, `cache-min-ttl: 60`, `prefetch: yes`, `serve-expired: yes`, переключение `/etc/resolv.conf` с бэкапом |
 | **3x-ui** | Обнаружение существующей панели | Интерактивное предложение запуска мастера Sanaei в конце работы |
 
 ---
@@ -124,6 +126,12 @@ bash migrate.sh ip
 Запускает тестирование пропускной способности сети (Download, Upload, Ping) через `speedtest-cli`:
 ```bash
 bash migrate.sh speed
+```
+
+### 8. `[DNS-DOT]` — Настройка локального шифрованного DoT DNS-кэша (`unbound`)
+Устанавливает `unbound` на `127.0.0.1:53` (закрыт снаружи), включает шифрованный DNS-over-TLS (`853`) с проверкой TLS-сертификатов через `1.1.1.1`, `8.8.8.8` и `9.9.9.9`, включает `prefetch` и `serve-expired` (`cache-min-ttl: 60`), делает бэкап `/etc/resolv.conf` и переключает системный DNS на `127.0.0.1`:
+```bash
+sudo bash migrate.sh dns
 ```
 
 ---

@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -326,11 +326,16 @@ setup_unbound_dot_dns() {
     log "Настройка локального шифрованного DoT DNS-кэша (unbound на 127.0.0.1:53)..."
 
     export DEBIAN_FRONTEND=noninteractive
-    if ! command -v unbound >/dev/null 2>&1 || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
-        log "Установка пакетов unbound, dns-root-data и ca-certificates..."
+    local need_anchor_pkg="false"
+    if [[ ! -s /var/lib/unbound/root.key && ! -s /usr/share/dns/root.key ]] && \
+       ! command -v unbound-anchor >/dev/null 2>&1 && [[ ! -x /usr/sbin/unbound-anchor ]]; then
+        need_anchor_pkg="true"
+    fi
+    if ! command -v unbound >/dev/null 2>&1 || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]] || [[ "$need_anchor_pkg" == "true" ]]; then
+        log "Установка пакетов unbound, unbound-anchor, dns-root-data и ca-certificates..."
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends unbound ca-certificates dns-root-data dnsutils || \
-            apt-get install -y -qq --no-install-recommends unbound ca-certificates dns-root-data || \
+        apt-get install -y -qq --no-install-recommends unbound unbound-anchor dns-root-data ca-certificates dnsutils || \
+            apt-get install -y -qq --no-install-recommends unbound unbound-anchor dns-root-data ca-certificates || \
             apt-get install -y -qq --no-install-recommends unbound ca-certificates
     fi
 
@@ -346,9 +351,12 @@ setup_unbound_dot_dns() {
     # Инициализация root trust anchor (/var/lib/unbound/root.key), иначе unbound-checkconf на Debian 13 падает
     mkdir -p /var/lib/unbound
     if [[ ! -s /var/lib/unbound/root.key ]]; then
-        if command -v unbound-anchor >/dev/null 2>&1; then
+        local anchor_bin=""
+        anchor_bin="$(command -v unbound-anchor 2>/dev/null || true)"
+        [[ -z "$anchor_bin" && -x /usr/sbin/unbound-anchor ]] && anchor_bin="/usr/sbin/unbound-anchor"
+        if [[ -n "$anchor_bin" ]]; then
             log "Инициализация DNSSEC root trust anchor (/var/lib/unbound/root.key)..."
-            unbound-anchor -a /var/lib/unbound/root.key || true
+            "$anchor_bin" -a /var/lib/unbound/root.key || true
         fi
         if [[ ! -s /var/lib/unbound/root.key && -s /usr/share/dns/root.key ]]; then
             cp -a /usr/share/dns/root.key /var/lib/unbound/root.key

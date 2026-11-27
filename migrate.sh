@@ -15,7 +15,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # ── Цвета и форматирование ────────────────────────────────────────────────────
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
@@ -327,9 +327,10 @@ setup_unbound_dot_dns() {
 
     export DEBIAN_FRONTEND=noninteractive
     if ! command -v unbound >/dev/null 2>&1 || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
-        log "Установка пакетов unbound и ca-certificates..."
+        log "Установка пакетов unbound, dns-root-data и ca-certificates..."
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends unbound ca-certificates dnsutils || \
+        apt-get install -y -qq --no-install-recommends unbound ca-certificates dns-root-data dnsutils || \
+            apt-get install -y -qq --no-install-recommends unbound ca-certificates dns-root-data || \
             apt-get install -y -qq --no-install-recommends unbound ca-certificates
     fi
 
@@ -337,10 +338,33 @@ setup_unbound_dot_dns() {
     if [[ ! -f "$cert_bundle" && -f /etc/ssl/certs/ca-bundle.crt ]]; then
         cert_bundle="/etc/ssl/certs/ca-bundle.crt"
     fi
-    [[ -f "$cert_bundle" ]] || die "Не найден системный CA bundle для проверки TLS (DoT)."
+    if [[ ! -f "$cert_bundle" ]]; then
+        err "Не найден системный CA bundle для проверки TLS (DoT)."
+        return 1
+    fi
+
+    # Инициализация root trust anchor (/var/lib/unbound/root.key), иначе unbound-checkconf на Debian 13 падает
+    mkdir -p /var/lib/unbound
+    if [[ ! -s /var/lib/unbound/root.key ]]; then
+        if command -v unbound-anchor >/dev/null 2>&1; then
+            log "Инициализация DNSSEC root trust anchor (/var/lib/unbound/root.key)..."
+            unbound-anchor -a /var/lib/unbound/root.key || true
+        fi
+        if [[ ! -s /var/lib/unbound/root.key && -s /usr/share/dns/root.key ]]; then
+            cp -a /usr/share/dns/root.key /var/lib/unbound/root.key
+        fi
+    fi
+    if id -u unbound >/dev/null 2>&1; then
+        chown -R unbound:unbound /var/lib/unbound 2>/dev/null || true
+    fi
+    if [[ ! -s /var/lib/unbound/root.key && -f /etc/unbound/unbound.conf.d/root-auto-trust-anchor-file.conf ]]; then
+        warn "Не удалось создать /var/lib/unbound/root.key, отключаем auto-trust-anchor-file.conf (DoT работает без него)."
+        mv /etc/unbound/unbound.conf.d/root-auto-trust-anchor-file.conf \
+           /etc/unbound/unbound.conf.d/root-auto-trust-anchor-file.conf.disabled
+    fi
 
     # Освобождаем порт 53 от stub-listener systemd-resolved, если он активен (например, на Ubuntu)
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if [[ -d /run/systemd/system ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         log "Отключение DNSStubListener у systemd-resolved для освобождения 53 порта..."
         mkdir -p /etc/systemd/resolved.conf.d
         cat << 'EOF' > /etc/systemd/resolved.conf.d/no-stub.conf
@@ -389,10 +413,26 @@ forward-zone:
     forward-addr: 9.9.9.9@853#dns.quad9.net
 EOF
 
-    unbound-checkconf || die "Ошибка в конфигурации unbound (/etc/unbound/unbound.conf.d/dot-cache.conf)."
+    if ! unbound-checkconf; then
+        err "Ошибка в конфигурации unbound (/etc/unbound/unbound.conf.d/dot-cache.conf)."
+        return 1
+    fi
 
-    systemctl enable unbound >/dev/null 2>&1 || true
-    systemctl restart unbound
+    if [[ -d /run/systemd/system ]]; then
+        systemctl enable unbound >/dev/null 2>&1 || true
+        if ! systemctl restart unbound; then
+            err "Не удалось запустить службу unbound (проверьте: journalctl -u unbound -n 20 --no-pager)."
+            return 1
+        fi
+    else
+        service unbound restart 2>/dev/null || {
+            pkill -x unbound 2>/dev/null || true
+            unbound -c /etc/unbound/unbound.conf || {
+                err "Не удалось запустить unbound."
+                return 1
+            }
+        }
+    fi
 
     # Проверяем резолв через 127.0.0.1 ДО переключения /etc/resolv.conf
     local test_ok="false"
@@ -1427,7 +1467,7 @@ run_scan_audit() {
 
     # DoT DNS-кэш диагностика
     local dot_status="не настроен"
-    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && systemctl is-active --quiet unbound 2>/dev/null; then
+    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && (systemctl is-active --quiet unbound 2>/dev/null || pgrep -x unbound >/dev/null 2>&1); then
         dot_status="активен (unbound DoT 127.0.0.1:53)"
     elif command -v unbound >/dev/null 2>&1; then
         dot_status="unbound установлен, dot-cache.conf не настроен"
@@ -2265,7 +2305,7 @@ EOF
 
 # ── Интерактивное предложение настройки DoT DNS-кэша (unbound) ────────────────
 prompt_unbound_dot_installation() {
-    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && systemctl is-active --quiet unbound 2>/dev/null; then
+    if [[ -f /etc/unbound/unbound.conf.d/dot-cache.conf ]] && (systemctl is-active --quiet unbound 2>/dev/null || pgrep -x unbound >/dev/null 2>&1); then
         ok "Локальный DoT DNS-кэш (unbound 127.0.0.1:53) уже активен."
         return 0
     fi
